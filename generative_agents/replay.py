@@ -67,4 +67,12 @@ def index():
 
 
 if __name__ == "__main__":
-    app.run(debug=True)
+    import argparse
+
+    parser = argparse.ArgumentParser(description="replay server")
+    parser.add_argument("--host", type=str, default="0.0.0.0", help="监听地址")
+    parser.add_argument("--port", type=int, default=6006, help="监听端口")
+    parser.add_argument("--debug", action="store_true", help="开启调试模式（勿对公网使用）")
+    args = parser.parse_args()
+
+    app.run(host=args.host, port=args.port, debug=args.debug, use_reloader=False)
