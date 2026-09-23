@@ -11,16 +11,7 @@ file_movement = "movement.json"
 
 frames_per_step = 60  # 每个step包含的帧数
 
-
-# 从存档文件中读取stride
-def get_stride(json_files):
-    if len(json_files) < 1:
-        return 1
-
-    with open(json_files[-1], "r", encoding="utf-8") as f:
-        config = json.load(f)
-
-    return config["stride"]
+maze_path = "frontend/static/assets/village/maze.json"
 
 
 # 将address转换为字符串
@@ -35,28 +26,154 @@ def get_location(address):
     return location
 
 
-# 插入第0帧数据（Agent的初始状态）
-def insert_frame0(init_pos, movement, agent_name):
-    key = "0"
-    if key not in movement.keys():
-        movement[key] = dict()
+class MovementBuilder:
+    """回放帧构建器。
 
-    json_path = f"frontend/static/assets/village/agents/{agent_name}/agent.json"
-    with open(json_path, "r", encoding="utf-8") as f:
-        json_data = json.load(f)
-        address = json_data["spatial"]["address"]["living_area"]
-    location = get_location(address)
-    coord = json_data["coord"]
-    init_pos[agent_name] = coord
-    movement[key][agent_name] = {
-        "location": location,
-        "movement": coord,
-        "description": "正在睡觉",
-    }
-    movement["description"][agent_name] = {
-        "currently": json_data["currently"],
-        "scratch": json_data["scratch"],
-    }
+    compress.py 用它一次性处理全部存档，replay.py 用它做实时增量处理，
+    两条链路共用同一份逻辑，以保证「实时流」与「事后压缩」的产出完全一致。
+
+    增量用法：反复调用 add_step() 喂入新的存档文件即可。跨步状态
+    （每个 Agent 的落点 _last_location、地图对象 _maze）会在实例内延续，
+    这正是增量结果能与全量结果逐字节对齐的前提。
+    """
+
+    def __init__(self):
+        self.stride = 1
+        self.start_datetime = ""
+        self.persona_init_pos = {}
+        self.all_movement = {"description": {}, "conversation": {}}
+        self.step = 0
+        self._last_location = {}
+        self._maze = None
+
+    def _get_maze(self):
+        if self._maze is None:
+            with open(maze_path, "r", encoding="utf-8") as f:
+                self._maze = Maze(json.load(f), None)
+        return self._maze
+
+    # 插入第0帧数据（Agent的初始状态）
+    def _insert_frame0(self, agent_name):
+        key = "0"
+        if key not in self.all_movement.keys():
+            self.all_movement[key] = dict()
+
+        json_path = f"frontend/static/assets/village/agents/{agent_name}/agent.json"
+        with open(json_path, "r", encoding="utf-8") as f:
+            json_data = json.load(f)
+            address = json_data["spatial"]["address"]["living_area"]
+        location = get_location(address)
+        coord = json_data["coord"]
+        self.persona_init_pos[agent_name] = coord
+        self.all_movement[key][agent_name] = {
+            "location": location,
+            "movement": coord,
+            "description": "正在睡觉",
+        }
+        self.all_movement["description"][agent_name] = {
+            "currently": json_data["currently"],
+            "scratch": json_data["scratch"],
+        }
+
+    # 处理单个存档文件，产出该步的 frames_per_step 帧
+    def add_step(self, json_data, conversation=None):
+        if conversation is None:
+            conversation = {}
+
+        if "stride" in json_data:
+            self.stride = json_data["stride"]
+
+        step = json_data["step"]
+        agents = json_data["agents"]
+
+        # 保存回放的起始时间
+        if len(self.start_datetime) < 1:
+            t = datetime.strptime(json_data["time"], "%Y%m%d-%H:%M")
+            self.start_datetime = t.isoformat()
+
+        # 遍历单个存档文件中的所有Agent
+        for agent_name, agent_data in agents.items():
+            # 插入第0帧
+            if step == 1:
+                self._insert_frame0(agent_name)
+
+            source_coord = self._last_location.get(agent_name, self.all_movement["0"][agent_name])["movement"]
+            target_coord = agent_data["coord"]
+            location = get_location(agent_data["action"]["event"]["address"])
+            if location is None:
+                location = self._last_location.get(agent_name, self.all_movement["0"][agent_name])["location"]
+                path = [source_coord]
+            else:
+                path = self._get_maze().find_path(source_coord, target_coord)
+
+            had_conversation = False
+            step_conversation = ""
+            persons_in_conversation = []
+            step_time = json_data["time"]
+            if step_time in conversation.keys():
+                for chats in conversation[step_time]:
+                    for persons, chat in chats.items():
+                        persons_in_conversation.append(persons.split(" @ ")[0].split(" -> "))
+                        step_conversation += f"\n地点：{persons.split(' @ ')[1]}\n\n"
+                        for c in chat:
+                            agent = c[0]
+                            text = c[1]
+                            step_conversation += f"{agent}：{text}\n"
+
+            for i in range(frames_per_step):
+                moving = len(path) > 1
+                if len(path) > 0:
+                    movement = list(path[0])
+                    path = path[1:]
+                    if agent_name not in self._last_location.keys():
+                        self._last_location[agent_name] = dict()
+                    self._last_location[agent_name]["movement"] = movement
+                    self._last_location[agent_name]["location"] = location
+                else:
+                    movement = None
+
+                if moving:
+                    action = f"前往 {location}"
+                elif movement is not None:
+                    action = agent_data["action"]["event"]["describe"]
+                    if len(action) < 1:
+                        action = f'{agent_data["action"]["event"]["predicate"]}{agent_data["action"]["event"]["object"]}'
+
+                    # 判断该存档文件中当前Agent是否有新的对话（用于设置图标）
+                    for persons in persons_in_conversation:
+                        if agent_name in persons:
+                            had_conversation = True
+                            break
+
+                    # 针对睡觉和对话设置图标
+                    if "睡觉" in action:
+                        action = "😴 " + action
+                    elif had_conversation:
+                        action = "💬 " + action
+
+                step_key = "%d" % ((step-1) * frames_per_step + 1 + i)
+                if step_key not in self.all_movement.keys():
+                    self.all_movement[step_key] = dict()
+
+                if movement is not None:
+                    self.all_movement[step_key][agent_name] = {
+                        "location": location,
+                        "movement": movement,
+                        "action": action,
+                    }
+            self.all_movement["conversation"][step_time] = step_conversation
+
+        self.step = step
+        return step
+
+    def result(self):
+        return {
+            "start_datetime": self.start_datetime,  # 起始时间
+            "stride": self.stride,  # 每个step对应的分钟数（必须与生成时的参数一致）
+            "sec_per_step": self.stride,  # 回放时每一帧对应的秒数
+            "persona_init_pos": self.persona_init_pos,  # 每个Agent的初始位置
+            "all_movement": self.all_movement,  # 所有Agent在每个setp中的位置变化
+        }
 
 
 # 从所有存档文件中提取数据（用于回放）
@@ -75,113 +192,14 @@ def generate_movement(checkpoints_folder, compressed_folder, compressed_file):
         if file_name.endswith(".json") and file_name != conversation_file:
             json_files.append(os.path.join(checkpoints_folder, file_name))
 
-    persona_init_pos = dict()
-    all_movement = dict()
-    all_movement["description"] = dict()
-    all_movement["conversation"] = dict()
-
-    stride = get_stride(json_files)
-    sec_per_step = stride
-
-    result = {
-        "start_datetime": "",  # 起始时间
-        "stride": stride,  # 每个step对应的分钟数（必须与生成时的参数一致）
-        "sec_per_step": sec_per_step,  # 回放时每一帧对应的秒数
-        "persona_init_pos": persona_init_pos,  # 每个Agent的初始位置
-        "all_movement": all_movement,  # 所有Agent在每个setp中的位置变化
-    }
-
-    last_location = dict()
-
-    # 加载地图数据，用于计算Agent移动路径
-    json_path = "frontend/static/assets/village/maze.json"
-    with open(json_path, "r", encoding="utf-8") as f:
-        json_data = json.load(f)
-        maze = Maze(json_data, None)
-
+    builder = MovementBuilder()
     for file_name in json_files:
         # 依次读取所有存档文件
         with open(file_name, "r", encoding="utf-8") as f:
             json_data = json.load(f)
-            step = json_data["step"]
-            agents = json_data["agents"]
+        builder.add_step(json_data, conversation)
 
-            # 保存回放的起始时间
-            if len(result["start_datetime"]) < 1:
-                t = datetime.strptime(json_data["time"], "%Y%m%d-%H:%M")
-                result["start_datetime"] = t.isoformat()
-
-            # 遍历单个存档文件中的所有Agent
-            for agent_name, agent_data in agents.items():
-                # 插入第0帧
-                if step == 1:
-                    insert_frame0(persona_init_pos, all_movement, agent_name)
-
-                source_coord = last_location.get(agent_name, all_movement["0"][agent_name])["movement"]
-                target_coord = agent_data["coord"]
-                location = get_location(agent_data["action"]["event"]["address"])
-                if location is None:
-                    location = last_location.get(agent_name, all_movement["0"][agent_name])["location"]
-                    path = [source_coord]
-                else:
-                    path = maze.find_path(source_coord, target_coord)
-
-                had_conversation = False
-                step_conversation = ""
-                persons_in_conversation = []
-                step_time = json_data["time"]
-                if step_time in conversation.keys():
-                    for chats in conversation[step_time]:
-                        for persons, chat in chats.items():
-                            persons_in_conversation.append(persons.split(" @ ")[0].split(" -> "))
-                            step_conversation += f"\n地点：{persons.split(' @ ')[1]}\n\n"
-                            for c in chat:
-                                agent = c[0]
-                                text = c[1]
-                                step_conversation += f"{agent}：{text}\n"
-
-                for i in range(frames_per_step):
-                    moving = len(path) > 1
-                    if len(path) > 0:
-                        movement = list(path[0])
-                        path = path[1:]
-                        if agent_name not in last_location.keys():
-                            last_location[agent_name] = dict()
-                        last_location[agent_name]["movement"] = movement
-                        last_location[agent_name]["location"] = location
-                    else:
-                        movement = None
-
-                    if moving:
-                        action = f"前往 {location}"
-                    elif movement is not None:
-                        action = agent_data["action"]["event"]["describe"]
-                        if len(action) < 1:
-                            action = f'{agent_data["action"]["event"]["predicate"]}{agent_data["action"]["event"]["object"]}'
-
-                        # 判断该存档文件中当前Agent是否有新的对话（用于设置图标）
-                        for persons in persons_in_conversation:
-                            if agent_name in persons:
-                                had_conversation = True
-                                break
-
-                        # 针对睡觉和对话设置图标
-                        if "睡觉" in action:
-                            action = "😴 " + action
-                        elif had_conversation:
-                            action = "💬 " + action
-
-                    step_key = "%d" % ((step-1) * frames_per_step + 1 + i)
-                    if step_key not in all_movement.keys():
-                        all_movement[step_key] = dict()
-
-                    if movement is not None:
-                        all_movement[step_key][agent_name] = {
-                            "location": location,
-                            "movement": movement,
-                            "action": action,
-                        }
-                all_movement["conversation"][step_time] = step_conversation
+    result = builder.result()
 
     # 保存数据
     with open(movement_file, "w", encoding="utf-8") as f:

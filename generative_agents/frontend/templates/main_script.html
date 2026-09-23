@@ -5,11 +5,44 @@
 	let zoom = {{ zoom|tojson }};
 	if (zoom <= 0) zoom = document.documentElement.clientWidth / 4400;
 
+	// 实时推进相关（is_live 为 true 时开启轮询与挂起等待）
+	let is_live = {{ is_live|tojson }};
+	let sim_name = {{ sim_name|tojson }};
+	let k_factor = {{ k|tojson }};
+	let k_explicit = {{ k_explicit|tojson }};
+	let avg_step_ms = {{ avg_step_ms|tojson }};
+	let latest_frame = {{ latest_frame|tojson }};
+	let run_status = {{ run_status|tojson }};
+	let frames_per_step = {{ frames_per_step|tojson }};
+	let use_k_rate = is_live || k_explicit;  // 是否按倍率控制节奏
+
 	let tile_width = 32;
 	let movement_speed = {{ play_speed|tojson }};
 	let execute_count_max = tile_width / movement_speed;
 	let execute_count = execute_count_max;
 	let all_movement = {{ all_movement|tojson }};
+
+	// 按倍率计算每个数据帧的停留时长：
+	// 目标 = 基准步耗时 / 倍率 / 每步帧数，再换算成 Phaser 的渲染帧数（约 60fps）
+	function apply_playback_rate() {
+		if (!use_k_rate) return;
+
+		let base_ms = is_live ? (avg_step_ms > 0 ? avg_step_ms : 330000) : step_size;
+		if (!(base_ms > 0)) base_ms = 330000;
+
+		let rate = k_factor > 0 ? k_factor : 1;
+		let frame_ms = base_ms / rate / frames_per_step;
+
+		execute_count_max = Math.max(1, Math.round(frame_ms / (1000 / 60)));
+		movement_speed = tile_width / execute_count_max;
+		// 必须把 execute_count 同步到新的 execute_count_max。
+		// 初始化时 execute_count 是按 play_speed 算出来的（倍率模式下是 8），
+		// 若只做「向下夹取」，它会与这里的最大值（如 147）不一致，于是
+		// update() 里 `execute_count == execute_count_max` 永不成立，
+		// movement_target 始终为空，第一帧读 [0] 就抛 TypeError → 黑屏。
+		execute_count = execute_count_max;
+	}
+	apply_playback_rate();
 
 	let datetime_options = { weekday: "long", year: "numeric", month: "long", day: "numeric" };
 	let start_datetime = new Date(Date.parse({{ start_datetime|tojson }}));
@@ -31,6 +64,8 @@
 
 	let finished = false;
 	let paused = false;
+	let waiting_data = false;   // 实时模式下正卡在「等待下一步数据」
+	let k_buttons = null;       // 倍率按钮
 
 	// Phaser configuration
 	const config = {
@@ -189,8 +224,32 @@
 		buttonHideConversation.setInteractive();
 		posX += buttonHideConversation.width + 10;
 
+		// 倍率切换：一步的播放时长 = 基准步耗时 / 倍率
+		k_buttons = {};
+		function refresh_k_buttons() {
+			for (let rate in k_buttons) {
+				k_buttons[rate].setBackgroundColor(Number(rate) == k_factor ? "#aaffaa" : "#ffffcc");
+			}
+		}
+		[1, 2, 3].forEach((rate) => {
+			let btn = add_text(this, posX, posY, " " + rate + "x ", "#ffffcc");
+			btn.setInteractive();
+			btn.on("pointerdown", () => {
+				k_factor = rate;
+				use_k_rate = true;
+				apply_playback_rate();
+				refresh_k_buttons();
+			});
+			k_buttons[rate] = btn;
+			posX += btn.width + 6;
+		});
+		refresh_k_buttons();
+
 		// Show current time
 		currentTime = add_text(this, posX, posY, "", "#ccffcc");
+
+		// 实时模式的运行状态提示
+		statusText = add_text(this, posX + currentTime.width + 20, posY, "", "#ff9999");
 
 		// Show conversation content
 		textConversation = add_text(this, 20, posY + currentTime.height + 10, " —— ", "#ccffcc");
@@ -342,6 +401,7 @@
 		}
 
 		// Moving personas
+		waiting_data = false;
 		for (let i = 0; i < Object.keys(personas).length; i++) {
 			let curr_persona_name = Object.keys(personas)[i];
 			let curr_persona = personas[curr_persona_name];
@@ -417,26 +477,93 @@
 				else if (pre_anims_direction_dict[curr_persona_name] == "d") curr_persona.setTexture(curr_persona_name, "down");
 				curr_persona.anims.stop();
 
-				finished = true;
-				buttonPlay.text = "[回放结束]";
-				buttonPause.setVisible(false);
+				// 数据尚未到达：实时模式下挂起等待，不再判定为回放结束
+				if (is_live) {
+					waiting_data = true;
+				} else {
+					finished = true;
+					buttonPlay.text = "[回放结束]";
+					buttonPause.setVisible(false);
+				}
 			}
 		}
 
 		if (execute_count == 0) {
-			for (let i = 0; i < Object.keys(personas).length; i++) {
-				let curr_persona_name = Object.keys(personas)[i];
-				let curr_persona = personas[curr_persona_name];
-				curr_persona.body.x = movement_target[curr_persona_name][0];
-				curr_persona.body.y = movement_target[curr_persona_name][1];
-			}
-			execute_count = execute_count_max + 1;
-			step = step + 1;
+			let next_step = step + 1;
+			// 只有下一步的帧已经拿到才推进；否则原地挂起，
+			// step 与虚拟时钟都冻结，等轮询把新帧取回来
+			if (next_step in all_movement) {
+				for (let i = 0; i < Object.keys(personas).length; i++) {
+					let curr_persona_name = Object.keys(personas)[i];
+					let curr_persona = personas[curr_persona_name];
+					if (movement_target[curr_persona_name]) {
+						curr_persona.body.x = movement_target[curr_persona_name][0];
+						curr_persona.body.y = movement_target[curr_persona_name][1];
+					}
+				}
+				execute_count = execute_count_max + 1;
+				step = next_step;
 
-			start_datetime = new Date(start_datetime.getTime() + step_size);
-			currentTime.setText(start_datetime.toLocaleTimeString("zh-CN", datetime_options));
+				start_datetime = new Date(start_datetime.getTime() + step_size);
+				currentTime.setText(start_datetime.toLocaleTimeString("zh-CN", datetime_options));
+			} else {
+				// 没有下一帧可用：原地等待，等轮询把新数据取回来。
+				// 注意 waiting_data 必须在这里置位——step 被冻结后不会再越界，
+				// 单靠上面 for 循环里的 else 分支是触发不了的。
+				execute_count = 1;
+				waiting_data = true;
+			}
 		}
 
 		execute_count -= 1;
+
+		// 实时模式的运行状态提示
+		if (is_live) {
+			if (run_status === "error") {
+				statusText.setText("数据获取失败，正在重试…");
+			} else if (waiting_data) {
+				if (run_status === "finished") {
+					finished = true;
+					waiting_data = false;
+					buttonPlay.text = "[模拟已结束]";
+					buttonPause.setVisible(false);
+					statusText.setText("模拟已结束");
+				} else {
+					statusText.setText("下一步生成中…");
+				}
+			} else {
+				statusText.setText("");
+			}
+		}
+	}
+
+	// 实时模式：每 2 秒轮询一次新帧，取到就自动接续播放
+	if (is_live) {
+		let seen_frame = latest_frame;
+		setInterval(function () {
+			if (finished) return;
+			fetch("/frames?name=" + encodeURIComponent(sim_name) + "&since=" + seen_frame)
+				.then(function (resp) {
+					if (!resp.ok) throw new Error("bad status " + resp.status);
+					return resp.json();
+				})
+				.then(function (data) {
+					if (data.error) return;
+					for (let key in data.frames) {
+						all_movement[key] = data.frames[key];
+					}
+					if (data.description) Object.assign(all_movement["description"], data.description);
+					if (data.conversation) Object.assign(all_movement["conversation"], data.conversation);
+					if (data.latest_frame > seen_frame) seen_frame = data.latest_frame;
+					run_status = data.status;
+					if (data.avg_step_ms > 0 && data.avg_step_ms != avg_step_ms) {
+						avg_step_ms = data.avg_step_ms;
+						apply_playback_rate();
+					}
+				})
+				.catch(function () {
+					run_status = "error";
+				});
+		}, 2000);
 	}
 </script>

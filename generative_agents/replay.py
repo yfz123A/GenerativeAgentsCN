@@ -1,10 +1,21 @@
 import os
+import sys
 import json
+import time
+import argparse
+import threading
 from datetime import datetime, timedelta
-from flask import Flask, render_template, request
 
-from compress import frames_per_step, file_movement
+from flask import Flask, render_template, request, jsonify
+
+# compress.py 与 start.py 都在模块级直接执行 argparse.parse_args()，
+# 为避免 replay.py 自己的启动参数被它们误解析，import 之前先把 argv 收干净。
+_argv_backup = sys.argv
+sys.argv = sys.argv[:1]
+from compress import frames_per_step, file_movement, MovementBuilder
 from start import personas
+sys.argv = _argv_backup
+
 
 app = Flask(
     __name__,
@@ -13,20 +24,302 @@ app = Flask(
     static_url_path="/static",
 )
 
+checkpoints_root = "results/checkpoints"
+compressed_root = "results/compressed"
+
+# 步耗时兜底值：模拟推进一个 step 所需真实毫秒数（本机实测约 5.5 分钟）
+default_step_ms = 330 * 1000
+# 步耗时的合理区间，用于夹住由文件 mtime 推算出的异常结果
+min_step_ms = 10 * 1000
+max_step_ms = 3600 * 1000
+# 判定「模拟已结束」的宽松系数：空闲时间超过 该系数 × 平均步耗时 才认为结束
+finish_grace = 3
+
+# 模拟刚启动、还没产出第一步时展示的等待页（会自动重试）
+waiting_page = """<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <title>小镇正在启动</title>
+  <meta http-equiv="refresh" content="10">
+</head>
+<body style="font-family: sans-serif; padding: 3em; text-align: center; color: #333;">
+  <h2>『{name}』正在初始化</h2>
+  <p>第一步需要为 25 位居民生成完整日程，通常约 8 分钟。</p>
+  <p>本页每 10 秒会自动重试，无需手动刷新。</p>
+</body>
+</html>"""
+
+
+def has_checkpoints(name):
+    """该模拟是否具备实时推进的数据源（存在 simulate-*.json 存档）"""
+    folder = os.path.join(checkpoints_root, name)
+    if not os.path.isdir(folder):
+        return False
+    for file_name in os.listdir(folder):
+        if file_name.startswith("simulate-") and file_name.endswith(".json"):
+            return True
+    return False
+
+
+class LiveSession:
+    """一次实时模拟的增量转换器与会话状态。
+
+    由前端轮询驱动：每次 refresh() 扫描存档目录，把新出现的存档喂给
+    MovementBuilder，产出的帧累积在内存中，同时落盘到
+    compressed/<name>/movement.json —— 即「边推边攒」，
+    于是模拟结束后无需再跑 compress.py 就已经有了完整的回放数据。
+    """
+
+    def __init__(self, name):
+        self.name = name
+        self.checkpoints_folder = os.path.join(checkpoints_root, name)
+        self.compressed_folder = os.path.join(compressed_root, name)
+        self.builder = MovementBuilder()
+        self.processed = []      # 已处理的存档文件名（有序）
+        self.file_times = []     # 与 processed 一一对应的 mtime
+        self.conversation = {}
+        self.last_new_data = time.time()
+        self._lock = threading.Lock()
+
+    # ---------- 增量转换 ----------
+    def _list_checkpoints(self):
+        if not os.path.isdir(self.checkpoints_folder):
+            return []
+        files = []
+        for file_name in os.listdir(self.checkpoints_folder):
+            if file_name.startswith("simulate-") and file_name.endswith(".json"):
+                files.append(file_name)
+        return sorted(files)
+
+    def refresh(self):
+        """扫描并处理新存档，返回是否吃到新数据"""
+        with self._lock:
+            new_files = [f for f in self._list_checkpoints() if f not in self.processed]
+            if len(new_files) < 1:
+                return False
+
+            # 对话是逐步累积的，每次取最新一份
+            conv_path = os.path.join(self.checkpoints_folder, "conversation.json")
+            if os.path.exists(conv_path):
+                try:
+                    with open(conv_path, "r", encoding="utf-8") as f:
+                        self.conversation = json.load(f)
+                except (json.JSONDecodeError, OSError):
+                    pass  # 模拟进程可能正在写入，下一轮再取
+
+            for file_name in new_files:
+                path = os.path.join(self.checkpoints_folder, file_name)
+                try:
+                    with open(path, "r", encoding="utf-8") as f:
+                        json_data = json.load(f)
+                except (json.JSONDecodeError, OSError):
+                    continue  # 文件尚未写完，留到下一轮
+                self.builder.add_step(json_data, self.conversation)
+                self.processed.append(file_name)
+                self.file_times.append(os.path.getmtime(path))
+
+            # 用文件自身的写入时间，而非当前时间：否则服务刚启动时，
+            # 会把几小时前就跑完的模拟误判成「正在运行」
+            if len(self.file_times) > 0:
+                self.last_new_data = self.file_times[-1]
+            self._dump()
+            return True
+
+    def _dump(self):
+        """边推边攒：把累积结果落盘，任何时刻都能用静态方式回放"""
+        try:
+            os.makedirs(self.compressed_folder, exist_ok=True)
+            with open(os.path.join(self.compressed_folder, file_movement), "w", encoding="utf-8") as f:
+                f.write(json.dumps(self.builder.result(), indent=2, ensure_ascii=False))
+        except OSError:
+            pass
+
+    # ---------- 状态 ----------
+    @property
+    def avg_step_ms(self):
+        """已完成步骤的平均真实耗时（毫秒）。
+
+        结果会被夹在 [min_step_ms, max_step_ms] 内：若存档是被批量拷贝进来的
+        而非逐步产生，文件 mtime 会挤在一起，直接换算会得到近乎为零的节奏，
+        进而让前端把人物移动速度放大到荒谬的程度。
+        """
+        if len(self.file_times) < 2:
+            return default_step_ms
+        span = self.file_times[-1] - self.file_times[0]
+        avg = span / (len(self.file_times) - 1) * 1000
+        return int(min(max(avg, min_step_ms), max_step_ms))
+
+    @property
+    def status(self):
+        if len(self.processed) < 1:
+            return "waiting"
+        idle = time.time() - self.last_new_data
+        if idle > max(600, self.avg_step_ms / 1000.0 * finish_grace):
+            return "finished"
+        return "running"
+
+    @property
+    def latest_frame(self):
+        latest = 0
+        for key in self.builder.all_movement.keys():
+            if key in ("description", "conversation"):
+                continue
+            try:
+                latest = max(latest, int(key))
+            except ValueError:
+                continue
+        return latest
+
+    # ---------- 数据导出 ----------
+    def frames_since(self, since):
+        """返回帧号大于 since 的帧（增量接口用）"""
+        frames = {}
+        for key, value in self.builder.all_movement.items():
+            if key in ("description", "conversation"):
+                continue
+            try:
+                frame_no = int(key)
+            except ValueError:
+                continue
+            if frame_no > since:
+                frames[key] = value
+        return {
+            "frames": frames,
+            "conversation": self.builder.all_movement["conversation"],
+            "description": self.builder.all_movement["description"],
+            "latest_frame": self.latest_frame,
+            "avg_step_ms": self.avg_step_ms,
+            "status": self.status,
+        }
+
+    def spawn_positions(self, target_step):
+        """「跳到最新」时人物的落点：取该步内每个 Agent 的第一个已知坐标，
+        避免首屏出现「从旧位置走过去」的穿墙瞬移。"""
+        start = (target_step - 1) * frames_per_step + 1
+        end = target_step * frames_per_step
+        positions = {}
+        for agent in personas:
+            coord = None
+            for frame_no in range(start, end + 1):
+                frame = self.builder.all_movement.get(str(frame_no))
+                if frame and agent in frame:
+                    coord = frame[agent]["movement"]
+                    break
+            if coord is None:
+                frame0 = self.builder.all_movement.get("0", {})
+                if agent in frame0:
+                    coord = frame0[agent]["movement"]
+            if coord is not None:
+                positions[agent] = coord
+        return positions
+
+    def build_payload(self, target_step=0):
+        """构造首屏注入数据。target_step 为 0 表示跳到最新一步。"""
+        step_count = self.builder.step
+        if step_count < 1:
+            return None
+        if target_step < 1 or target_step > step_count:
+            target_step = step_count
+
+        start = (target_step - 1) * frames_per_step + 1
+        end = target_step * frames_per_step
+
+        frames = {}
+        for frame_no in range(start, end + 1):
+            key = str(frame_no)
+            if key in self.builder.all_movement:
+                frames[key] = self.builder.all_movement[key]
+
+        start_datetime = ""
+        if len(self.builder.start_datetime) > 0:
+            t = datetime.fromisoformat(self.builder.start_datetime)
+            t = t + timedelta(minutes=self.builder.stride * (target_step - 1))
+            start_datetime = t.isoformat()
+
+        return {
+            "start_datetime": start_datetime,
+            "stride": self.builder.stride,
+            "sec_per_step": self.builder.stride,
+            "persona_init_pos": self.spawn_positions(target_step),
+            "all_movement": dict(
+                frames,
+                description=self.builder.all_movement["description"],
+                conversation=self.builder.all_movement["conversation"],
+            ),
+            "step": start,
+            "latest_frame": self.latest_frame,
+            "avg_step_ms": self.avg_step_ms,
+            "status": self.status,
+        }
+
+
+_sessions = {}
+_sessions_lock = threading.Lock()
+
+
+def get_session(name):
+    with _sessions_lock:
+        if name not in _sessions:
+            _sessions[name] = LiveSession(name)
+        return _sessions[name]
+
 
 @app.route("/", methods=['GET'])
 def index():
     name = request.args.get("name", "")          # 记录名称
     step = int(request.args.get("step", 0))      # 回放起始步数
-    speed = int(request.args.get("speed", 2))    # 回放速度（0~5）
+    speed = int(request.args.get("speed", 2))    # 回放速度（0~5，静态模式生效）
     zoom = float(request.args.get("zoom", 0.8))  # 画面缩放比例
+    k_arg = request.args.get("k", "")            # 倍率（实时模式下生效）
 
-    if len(name) > 0:
-        compressed_folder = f"results/compressed/{name}"
-    else:
+    if len(name) < 1:
         return f"Invalid name of the simulation: '{name}'"
 
-    replay_file = f"{compressed_folder}/{file_movement}"
+    # 有存档就走实时管道；checkpoint 目录已建但还没落盘第一步的也留在实时管道里
+    # （展示等待页），只有完全没有 checkpoint 目录时才退回读取现成的 movement.json
+    # （例如发布版内置的 example）
+    live = has_checkpoints(name) or os.path.isdir(os.path.join(checkpoints_root, name))
+
+    # 倍率：实时模式默认 2；静态模式默认沿用 speed，传了 k 才切到倍率控制
+    k_explicit = len(k_arg) > 0
+    try:
+        k = float(k_arg) if k_explicit else (2.0 if live else 0.0)
+    except ValueError:
+        k_explicit = False
+        k = 2.0 if live else 0.0
+
+    if live:
+        session = get_session(name)
+        session.refresh()
+        params = session.build_payload(step)
+        if params is None:
+            # 目录已建但第一步还没落盘，给一个会自动重试的等待页
+            return waiting_page.format(name=name)
+
+        return render_template(
+            "index.html",
+            persona_names=personas,
+            step=params["step"],
+            play_speed=2 ** speed,
+            zoom=zoom,
+            is_live=True,
+            sim_name=name,
+            k=k,
+            k_explicit=k_explicit,
+            avg_step_ms=params["avg_step_ms"],
+            latest_frame=params["latest_frame"],
+            run_status=params["status"],
+            frames_per_step=frames_per_step,
+            start_datetime=params["start_datetime"],
+            stride=params["stride"],
+            sec_per_step=params["sec_per_step"],
+            persona_init_pos=params["persona_init_pos"],
+            all_movement=params["all_movement"],
+        )
+
+    # ---------- 静态回放 ----------
+    replay_file = f"{compressed_root}/{name}/{file_movement}"
     if not os.path.exists(replay_file):
         return f"The data file doesn‘t exist: '{replay_file}'<br />Run compress.py to generate the data first."
 
@@ -62,13 +355,36 @@ def index():
         step=step,
         play_speed=speed,
         zoom=zoom,
+        is_live=False,
+        sim_name=name,
+        k=k,
+        k_explicit=k_explicit,
+        avg_step_ms=0,
+        latest_frame=0,
+        run_status="static",
+        frames_per_step=frames_per_step,
         **params
     )
 
 
-if __name__ == "__main__":
-    import argparse
+@app.route("/frames", methods=['GET'])
+def frames():
+    """增量接口：返回帧号大于 since 的所有帧"""
+    name = request.args.get("name", "")
+    try:
+        since = int(request.args.get("since", 0))
+    except ValueError:
+        since = 0
 
+    if len(name) < 1 or not has_checkpoints(name):
+        return jsonify({"error": "not a live simulation"}), 404
+
+    session = get_session(name)
+    session.refresh()
+    return jsonify(session.frames_since(since))
+
+
+if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="replay server")
     parser.add_argument("--host", type=str, default="0.0.0.0", help="监听地址")
     parser.add_argument("--port", type=int, default=6006, help="监听端口")
