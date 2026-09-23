@@ -7,6 +7,8 @@
 
 	// 实时推进相关（is_live 为 true 时开启轮询与挂起等待）
 	let is_live = {{ is_live|tojson }};
+	// 直播台（画面由共享时间轴推出；下面的 update() 会据此走独立分支）
+	let is_broadcast = {{ is_broadcast|tojson }};
 	let sim_name = {{ sim_name|tojson }};
 	let k_factor = {{ k|tojson }};
 	let k_explicit = {{ k_explicit|tojson }};
@@ -15,6 +17,27 @@
 	let run_status = {{ run_status|tojson }};
 	let frames_per_step = {{ frames_per_step|tojson }};
 	let use_k_rate = is_live || k_explicit;  // 是否按倍率控制节奏
+
+{% if is_broadcast %}
+	// ---------- 直播台 ----------
+	// 画面内容 = f(当前时间)。所有观众用同一个公式算出同一个帧号，
+	// 因此不需要服务端推送：卡顿、后台标签页、时钟漂移都会自动纠正。
+	let anchor_ms = {{ anchor_ms|tojson }};                        // 固定的轮内纪元
+	let ms_per_frame = {{ ms_per_frame|tojson }};                  // 每个数据帧占用的真实毫秒
+	let total_frames = {{ total_frames|tojson }};                  // 一轮的总帧数
+	let total_steps = {{ total_steps|tojson }};                    // 一轮的总步数
+	let cycle_ms = ms_per_frame * total_frames;                    // 一轮的真实时长
+	let min_per_step = {{ stride|tojson }};                        // 每步对应多少模拟分钟
+	let clock_offset_ms = {{ server_now_ms|tojson }} - Date.now(); // 服务端时间 - 本地时间
+	function server_now_ms() { return Date.now() + clock_offset_ms; }
+
+	// 每 60 秒用服务端时间重新校正一次本地时钟（防止本地时钟本身不准或漂移）
+	setInterval(function () {
+		fetch("/now").then(function (r) { return r.json(); }).then(function (d) {
+			if (d && d.server_now_ms) clock_offset_ms = d.server_now_ms - Date.now();
+		}).catch(function () {});
+	}, 60000);
+{% endif %}
 
 	let tile_width = 32;
 	let movement_speed = {{ play_speed|tojson }};
@@ -207,7 +230,9 @@
 		posX = 20;
 		posY = 20;
 
+{% if not is_broadcast %}
 		// Add button: play, pause ...
+		// （直播台不提供运行/暂停：任何一个人暂停都会立刻脱离共同时间轴）
 		buttonPlay = add_text(this, posX, posY, "[运行]", "#ffffcc");
 		buttonPlay.setInteractive();
 		posX += buttonPlay.width + 10;
@@ -215,6 +240,7 @@
 		buttonPause = add_text(this, posX, posY, " 暂停 ", "#ffffcc");
 		buttonPause.setInteractive();
 		posX += buttonPause.width + 10;
+{% endif %}
 
 		buttonShowConversation = add_text(this, posX, posY, "[显示对话]", "#ffffcc");
 		buttonShowConversation.setInteractive();
@@ -224,7 +250,9 @@
 		buttonHideConversation.setInteractive();
 		posX += buttonHideConversation.width + 10;
 
+{% if not is_broadcast %}
 		// 倍率切换：一步的播放时长 = 基准步耗时 / 倍率
+		// （直播台的节奏由服务端常量决定，观众改不了）
 		k_buttons = {};
 		function refresh_k_buttons() {
 			for (let rate in k_buttons) {
@@ -244,6 +272,7 @@
 			posX += btn.width + 6;
 		});
 		refresh_k_buttons();
+{% endif %}
 
 		// Show current time
 		currentTime = add_text(this, posX, posY, "", "#ccffcc");
@@ -334,6 +363,7 @@
 
 	// Update function
 	function update(time, delta) {
+{% if not is_broadcast %}
 		// Setup play and pause button
 		buttonPlay.on("pointerdown", function() {
 			if (finished) return;
@@ -348,6 +378,7 @@
 			buttonPause.text = "[暂停]";
 			paused = true;
 		});
+{% endif %}
 
 		buttonShowConversation.on("pointerdown", function() {
 			buttonShowConversation.text = "[显示对话]";
@@ -382,6 +413,12 @@
 			player.body.x = personas[curr_focused_persona].body.x;
 			player.body.y = personas[curr_focused_persona].body.y;
 			document.getElementById("temp_focus").innerHTML = "";
+		}
+
+		// 直播台：画面完全由当前时间推出，走独立的推进分支（上面的镜头/交互保留）
+		if (is_broadcast) {
+			update_broadcast();
+			return;
 		}
 
 		if (finished || paused) {
@@ -536,6 +573,128 @@
 			}
 		}
 	}
+
+{% if is_broadcast %}
+	// ---------- 直播台：帧号完全由时间推出，帧内按毫秒插值 ----------
+	let bc_last_frame = -1;
+	let bc_last_step = -1;
+
+	// 某角色在第 frame_no 帧的格子；该帧没有这个角色（没走动）时返回 null
+	function bc_coord(agent_name, frame_no) {
+		let frame = all_movement[frame_no];
+		if (!frame) return null;
+		let entry = frame[agent_name];
+		return entry ? entry["movement"] : null;
+	}
+
+	// 预先算好「每一帧每个角色在哪」：某帧没有该角色（这一步没走动）时，沿用上一帧的位置。
+	// 有了这张表，中途加入、时间大跳（后台标签页回来）、循环接缝都只是查表，
+	// 永远能拿到与数据一致的正确落点，不需要任何跨帧的临时状态。
+	let bc_pos = null;   // 首次 update 时才建表：那时 create() 已经把 25 个角色都建好了
+	function bc_build_pos_table() {
+		bc_pos = {};
+		let names = Object.keys(personas);
+		for (let i = 0; i < names.length; i++) {
+			let key = names[i].replace("_", " ");
+			let table = new Array(total_frames + 1);
+			let last = null;
+			for (let f = 0; f <= total_frames; f++) {
+				let c = bc_coord(key, f);
+				if (c != null) last = c;
+				table[f] = last;
+			}
+			bc_pos[names[i]] = table;
+		}
+	}
+
+	function bc_conversation_key(t) {
+		let y = t.getFullYear().toString().padStart(4, "0");
+		let m = (t.getMonth() + 1).toString().padStart(2, "0");
+		let d = t.getDate().toString().padStart(2, "0");
+		let hh = t.getHours().toString().padStart(2, "0");
+		let mm = t.getMinutes().toString().padStart(2, "0");
+		return y + m + d + "-" + hh + ":" + mm;
+	}
+
+	function update_broadcast() {
+		if (bc_pos === null) bc_build_pos_table();
+
+		// 当前时间 -> 轮内毫秒 -> 帧号 + 帧内进度。每一帧都从头算，所以不存在累积误差。
+		let t = (server_now_ms() - anchor_ms) % cycle_ms;
+		if (t < 0) t += cycle_ms;
+		let frame = Math.floor(t / ms_per_frame) + 1;        // 1 .. total_frames
+		let progress = (t % ms_per_frame) / ms_per_frame;    // 0 .. 1
+		let step = Math.floor((frame - 1) / frames_per_step) + 1;
+
+		let frame_changed = (frame != bc_last_frame);
+		let step_changed = (step != bc_last_step);
+
+		for (let i = 0; i < Object.keys(personas).length; i++) {
+			let agent = Object.keys(personas)[i];
+			let persona = personas[agent];
+			let key = agent.replace("_", " ");
+
+			// 查表：这一帧从 frame-1 格走到 frame 格（表里已把「该步没走动」的帧补成上一格）
+			let table = bc_pos[agent];
+			let from = table[frame - 1];
+			let to = table[frame];
+			if (from == null) from = to;
+			if (to == null) to = from;
+			if (from == null) continue;   // 整个录像里都没有这个角色的数据（正常不会发生）
+
+			let px = (from[0] + (to[0] - from[0]) * progress) * tile_width;
+			let py = (from[1] + (to[1] - from[1]) * progress) * tile_width;
+			persona.body.x = px;
+			persona.body.y = py;
+			pronunciatios[agent].x = px - 15;
+			pronunciatios[agent].y = py - 15 - 25;
+
+			let dx = to[0] - from[0];
+			let dy = to[1] - from[1];
+			let direction = dx > 0 ? "r" : (dx < 0 ? "l" : (dy > 0 ? "d" : (dy < 0 ? "u" : "")));
+			if (direction != "") {
+				pre_anims_direction_dict[agent] = direction;
+				let anim_name = {
+					"r": agent + "-right-walk", "l": agent + "-left-walk",
+					"d": agent + "-down-walk", "u": agent + "-up-walk"
+				}[direction];
+				persona.anims.play(anim_name, true);
+			} else {
+				persona.anims.stop();
+				let still = { "r": "right", "l": "left", "d": "down", "u": "up" }[pre_anims_direction_dict[agent]];
+				if (still) persona.setTexture(agent, still);
+			}
+
+			// 文字（动作、详情面板）只在帧号变化时刷新，避免每帧写 DOM
+			if (frame_changed) {
+				let entry = all_movement[frame] ? all_movement[frame][key] : null;
+				if (entry) {
+					let act = entry["action"];
+					act = act.length > 25 ? act.substring(0, 20) + "..." : act;
+					pronunciatios[agent].setText(agent + ": " + act);
+					let desc = all_movement["description"][agent];
+					if (desc) document.getElementById("agent_desc__" + agent).innerHTML = desc["currently"];
+					document.getElementById("current_action__" + agent).innerHTML = entry["action"];
+					document.getElementById("target_address__" + agent).innerHTML = entry["location"];
+				}
+			}
+		}
+
+		// 时钟、对话记录、节目单：都与当前步严格对应（顺带修掉「每步只走 10 秒」）
+		if (step_changed) {
+			bc_last_step = step;
+			let cur_time = new Date(start_datetime.getTime() + min_per_step * 60000 * (step - 1));
+			currentTime.setText(cur_time.toLocaleTimeString("zh-CN", datetime_options));
+			let conv_key = bc_conversation_key(cur_time);
+			let conv = all_movement["conversation"][conv_key];
+			if (conv !== undefined && conv !== "") {
+				textConversation.setText(`\n${conv_key} 对话记录：\n` + conv);
+			}
+			statusText.setText(`第 ${step}/${total_steps} 步`);
+		}
+		bc_last_frame = frame;
+	}
+{% endif %}
 
 	// 实时模式：每 2 秒轮询一次新帧，取到就自动接续播放
 	if (is_live) {

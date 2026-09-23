@@ -35,6 +35,13 @@ max_step_ms = 3600 * 1000
 # 判定「模拟已结束」的宽松系数：空闲时间超过 该系数 × 平均步耗时 才认为结束
 finish_grace = 3
 
+# ---------- 直播台（broadcast）参数 ----------
+# 固定纪元：轮内相位是「当前时间的纯函数」，所以服务重启、换容器、重新部署之后，
+# 所有观众算出来的位置都自动一致，不需要任何持久化状态。
+broadcast_anchor_ms = 1767225600000  # 2026-01-01T00:00:00Z
+# 每个 step 占用的真实毫秒数：1 分钟/步，即模拟时间以 10 倍速前进
+broadcast_ms_per_step = 60 * 1000
+
 # 模拟刚启动、还没产出第一步时展示的等待页（会自动重试）
 waiting_page = """<!DOCTYPE html>
 <html lang="zh-CN">
@@ -265,38 +272,90 @@ def get_session(name):
         return _sessions[name]
 
 
+def load_recording(name):
+    """读取一份完整的录像（compress.py 的产物）；不存在则返回 None"""
+    path = os.path.join(compressed_root, name, file_movement)
+    if not os.path.exists(path):
+        return None
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def broadcast_meta(params):
+    """直播台的时间轴参数：帧号完全由「当前时间」决定，客户端不保存任何进度"""
+    frames = [int(k) for k in params["all_movement"] if k not in ("description", "conversation")]
+    total_frames = max(frames) if len(frames) > 0 else 0
+    return {
+        "total_frames": total_frames,
+        "total_steps": (total_frames + frames_per_step - 1) // frames_per_step,
+        "ms_per_frame": broadcast_ms_per_step // frames_per_step,
+    }
+
+
+@app.route("/now", methods=['GET'])
+def now():
+    """直播台客户端用它校正本地时钟：返回服务端当前的毫秒时间戳"""
+    return jsonify({"server_now_ms": int(time.time() * 1000)})
+
+
 @app.route("/", methods=['GET'])
 def index():
     name = request.args.get("name", "")          # 记录名称
-    step = int(request.args.get("step", 0))      # 回放起始步数
-    speed = int(request.args.get("speed", 2))    # 回放速度（0~5，静态模式生效）
-    zoom = float(request.args.get("zoom", 0.8))  # 画面缩放比例
-    k_arg = request.args.get("k", "")            # 倍率（实时模式下生效）
-    mode = request.args.get("mode", "").lower()  # 播放方式：static(录播) / live(实时)，留空为自动
+    zoom = float(request.args.get("zoom", 0.8))  # 画面缩放比例（纯本地视觉，不进时间轴）
+    mode = request.args.get("mode", "").lower()  # 留空 = 直播台；static / live 是隐藏入口
 
     if len(name) < 1:
         return f"Invalid name of the simulation: '{name}'"
 
-    if mode not in ("", "static", "live"):
-        return f"Invalid mode '{mode}': 只支持 mode=static（录播）或 mode=live（实时），留空为自动分流。"
+    if mode not in ("", "broadcast", "static", "live"):
+        return (f"Invalid mode '{mode}': 留空或 mode=broadcast 是直播台，"
+                f"mode=static 是录播，mode=live 是实时。")
+
+    # ---------- 直播台（默认入口）----------
+    # 画面内容完全由「当前时间 + 固定纪元」推出，所以两个观众看到的是同一时刻的小镇。
+    # 时间轴参数一律收在服务端常量里：URL 上的 step / speed / k 在这里被彻底忽略。
+    if mode in ("", "broadcast"):
+        params = load_recording(name)
+        if params is None:
+            return (f"'{name}' 还没有录像文件 {compressed_root}/{name}/{file_movement}，无法开播。"
+                    f"<br />先跑：python compress.py --name {name}")
+        return render_template(
+            "index.html",
+            persona_names=personas,
+            step=1,
+            play_speed=2 ** 2,
+            zoom=zoom,
+            is_live=False,
+            is_broadcast=True,
+            sim_name=name,
+            k=0.0,
+            k_explicit=False,
+            avg_step_ms=0,
+            latest_frame=0,
+            run_status="broadcast",
+            frames_per_step=frames_per_step,
+            anchor_ms=broadcast_anchor_ms,
+            server_now_ms=int(time.time() * 1000),
+            **broadcast_meta(params),
+            **params,
+        )
+
+    # ---------- 隐藏入口：录播 / 实时 ----------
+    step = int(request.args.get("step", 0))      # 回放起始步数（仅隐藏入口使用）
+    speed = int(request.args.get("speed", 2))    # 回放速度（0~5，静态模式生效）
+    k_arg = request.args.get("k", "")            # 倍率（实时模式下生效）
 
     has_ckpt_folder = os.path.isdir(os.path.join(checkpoints_root, name))
 
-    # 自动分流：有存档就走实时管道；checkpoint 目录已建但还没落盘第一步的也留在实时管道里
-    # （展示等待页），只有完全没有 checkpoint 目录时才退回读取现成的 movement.json
-    # （例如发布版内置的 example）。
-    # 传了 mode=static / mode=live 时，以显式指定的为准 —— 这样已经跑过的模拟（目录里
+    # 传了 mode=static / mode=live 时以显式指定的为准 —— 这样已经跑过的模拟（目录里
     # 留着 checkpoints）也能用 &mode=static 当录播看，不必把存档目录搬走。
     if mode == "static":
         live = False
-    elif mode == "live":
+    else:
         if not has_ckpt_folder:
             return (f"'{name}' 没有存档目录 results/checkpoints/{name}，无法实时播放。<br />"
-                    f"想看录播请去掉 mode=live（或改用 mode=static），"
-                    f"前提是已经跑过 compress.py --name {name}。")
+                    f"想看录播请改用 mode=static，前提是已经跑过 compress.py --name {name}。")
         live = True
-    else:
-        live = has_checkpoints(name) or has_ckpt_folder
 
     # 倍率：实时模式默认 2；静态模式默认沿用 speed，传了 k 才切到倍率控制
     k_explicit = len(k_arg) > 0
@@ -321,6 +380,7 @@ def index():
             play_speed=2 ** speed,
             zoom=zoom,
             is_live=True,
+            is_broadcast=False,
             sim_name=name,
             k=k,
             k_explicit=k_explicit,
@@ -373,6 +433,7 @@ def index():
         play_speed=speed,
         zoom=zoom,
         is_live=False,
+        is_broadcast=False,
         sim_name=name,
         k=k,
         k_explicit=k_explicit,
