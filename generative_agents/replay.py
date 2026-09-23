@@ -272,14 +272,31 @@ def index():
     speed = int(request.args.get("speed", 2))    # 回放速度（0~5，静态模式生效）
     zoom = float(request.args.get("zoom", 0.8))  # 画面缩放比例
     k_arg = request.args.get("k", "")            # 倍率（实时模式下生效）
+    mode = request.args.get("mode", "").lower()  # 播放方式：static(录播) / live(实时)，留空为自动
 
     if len(name) < 1:
         return f"Invalid name of the simulation: '{name}'"
 
-    # 有存档就走实时管道；checkpoint 目录已建但还没落盘第一步的也留在实时管道里
+    if mode not in ("", "static", "live"):
+        return f"Invalid mode '{mode}': 只支持 mode=static（录播）或 mode=live（实时），留空为自动分流。"
+
+    has_ckpt_folder = os.path.isdir(os.path.join(checkpoints_root, name))
+
+    # 自动分流：有存档就走实时管道；checkpoint 目录已建但还没落盘第一步的也留在实时管道里
     # （展示等待页），只有完全没有 checkpoint 目录时才退回读取现成的 movement.json
-    # （例如发布版内置的 example）
-    live = has_checkpoints(name) or os.path.isdir(os.path.join(checkpoints_root, name))
+    # （例如发布版内置的 example）。
+    # 传了 mode=static / mode=live 时，以显式指定的为准 —— 这样已经跑过的模拟（目录里
+    # 留着 checkpoints）也能用 &mode=static 当录播看，不必把存档目录搬走。
+    if mode == "static":
+        live = False
+    elif mode == "live":
+        if not has_ckpt_folder:
+            return (f"'{name}' 没有存档目录 results/checkpoints/{name}，无法实时播放。<br />"
+                    f"想看录播请去掉 mode=live（或改用 mode=static），"
+                    f"前提是已经跑过 compress.py --name {name}。")
+        live = True
+    else:
+        live = has_checkpoints(name) or has_ckpt_folder
 
     # 倍率：实时模式默认 2；静态模式默认沿用 speed，传了 k 才切到倍率控制
     k_explicit = len(k_arg) > 0
