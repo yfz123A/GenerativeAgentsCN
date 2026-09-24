@@ -1,0 +1,48 @@
+{
+  "world": {
+    "start": "20250213-09:30",
+    "stride": 10,
+    "years_per_sim_day": 4
+  },
+  "population": {
+    "cap": 40,
+    "births_per_year": 3,
+    "adult_age": 18,
+    "school_age": 6,
+    "marry_min_age": 18,
+    "fertility_max_age": 45,
+    "pregnancy_days": 1
+  },
+  "mortality": {
+    "profile": "standard",
+    "dice_seed": 20260924
+  },
+  "housing_pool": [],
+  "agents": [
+    { "name": "唐诗雅", "gender": "女", "age": 20, "spouse": null, "children": [], "home": ["the Ville", "奥克山学院宿舍", "唐诗雅的房间"] },
+    { "name": "冯远帆", "gender": "男", "age": 20, "spouse": null, "children": [], "home": ["the Ville", "奥克山学院宿舍", "冯远帆的房间"] },
+    { "name": "江雨桐", "gender": "女", "age": 21, "spouse": null, "children": [], "home": ["the Ville", "奥克山学院宿舍", "江雨桐的房间"] },
+    { "name": "雷振宇", "gender": "男", "age": 21, "spouse": null, "children": [], "home": ["the Ville", "奥克山学院宿舍", "雷振宇的房间"] },
+    { "name": "林晚晴", "gender": "女", "age": 44, "spouse": "陈守信", "children": ["陈子谦"], "home": ["the Ville", "林氏家族的房子", "陈守信与林晚晴的卧室"] },
+    { "name": "陈守信", "gender": "男", "age": 45, "spouse": "林晚晴", "children": ["陈子谦"], "home": ["the Ville", "林氏家族的房子", "陈守信与林晚晴的卧室"] },
+    { "name": "陈子谦", "gender": "男", "age": 19, "spouse": null, "children": [], "parents": ["陈守信", "林晚晴"], "home": ["the Ville", "林氏家族的房子", "陈子谦的卧室"] },
+    { "name": "苏婉如", "gender": "女", "age": 46, "spouse": "周正阳", "children": [], "home": ["the Ville", "周氏家族的房子", "周正阳与苏婉如的卧室"] },
+    { "name": "周正阳", "gender": "男", "age": 52, "spouse": "苏婉如", "children": [], "home": ["the Ville", "周氏家族的房子", "周正阳与苏婉如的卧室"] },
+    { "name": "沈佳怡", "gender": "女", "age": 33, "spouse": null, "children": [], "home": ["the Ville", "许诺言与沈佳怡的家", "沈佳怡的房间"] },
+    { "name": "许诺言", "gender": "女", "age": 30, "spouse": null, "children": [], "home": ["the Ville", "许诺言与沈佳怡的家", "许诺言的房间"] },
+    { "name": "赵北辰", "gender": "男", "age": 42, "spouse": null, "children": [], "home": ["the Ville", "赵北辰的公寓", "主人房"] },
+    { "name": "叶知秋", "gender": "女", "age": 34, "spouse": null, "children": [], "home": ["the Ville", "叶知秋的公寓", "主人房"] },
+    { "name": "郑卫国", "gender": "男", "age": 65, "spouse": "白文露", "children": [], "home": ["the Ville", "郑氏家族的房子", "主人房"] },
+    { "name": "白文露", "gender": "女", "age": 68, "spouse": "郑卫国", "children": [], "home": ["the Ville", "郑氏家族的房子", "主人房"] },
+    { "name": "马乐天", "gender": "男", "age": 23, "spouse": null, "children": [], "home": ["the Ville", "艺术家共居空间", "马乐天的房间"] },
+    { "name": "温若言", "gender": "女", "age": 30, "spouse": null, "children": [], "home": ["the Ville", "艺术家共居空间", "温若言的房间"] },
+    { "name": "康有年", "gender": "男", "age": 27, "spouse": null, "children": [], "home": ["the Ville", "艺术家共居空间", "康有年的房间"] },
+    { "name": "柳青禾", "gender": "女", "age": 25, "spouse": null, "children": [], "home": ["the Ville", "艺术家共居空间", "柳青禾的房间"] },
+    { "name": "夏小禾", "gender": "女", "age": 25, "spouse": null, "children": [], "home": ["the Ville", "艺术家共居空间", "夏小禾的房间"] },
+    { "name": "顾北舟", "gender": "男", "age": 32, "spouse": null, "children": [], "home": ["the Ville", "顾北舟的公寓", "主人房"] },
+    { "name": "钱思远", "gender": "男", "age": 41, "spouse": null, "children": [], "home": ["the Ville", "钱思远的公寓", "主人房"] },
+    { "name": "方启", "gender": "男", "age": 29, "spouse": null, "children": [], "home": ["the Ville", "方启的公寓", "主人房"] },
+    { "name": "尹百合", "gender": "女", "age": 28, "spouse": null, "children": [], "home": ["the Ville", "尹百合的房子", "主人房"] },
+    { "name": "石一鸣", "gender": "男", "age": 36, "spouse": null, "children": [], "home": ["the Ville", "石一鸣的家", "主人房"] }
+  ]
+}

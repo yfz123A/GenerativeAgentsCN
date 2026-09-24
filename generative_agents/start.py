@@ -2,6 +2,7 @@ import os
 import copy
 import json
 import time
+import shutil
 import argparse
 import datetime
 
@@ -9,17 +10,12 @@ from dotenv import load_dotenv, find_dotenv
 
 from modules.game import create_game, get_game
 from modules import utils
+from modules import life
+from modules import memory
+from modules.life import seed_personas
 
-personas = [
-    "阿伊莎", "克劳斯", "玛丽亚", "沃尔夫冈",  # 学生
-    "梅", "约翰", "埃迪",  # 家庭：教授、药店主人、学生
-    "简", "汤姆",  # 家庭：家庭主妇、市场主人
-    "卡门", "塔玛拉",  # 室友：供应店主人、儿童读物作家
-    "亚瑟", "伊莎贝拉",  # 酒吧老板、咖啡馆老板
-    "山姆", "詹妮弗",  # 家庭：退役军官、水彩画家
-    "弗朗西斯科", "海莉", "拉吉夫", "拉托亚",  # 共居空间：喜剧演员、作家、画家、摄影师
-    "阿比盖尔", "卡洛斯", "乔治", "瑞恩", "山本百合子", "亚当",  # 动画师、诗人、数学家、软件工程师、税务律师、哲学家
-]
+# 花名册从种子来（data/seed.json）；性别/婚配/生死等生命参数见种子文件
+personas = seed_personas()
 
 
 class SimulateServer:
@@ -70,11 +66,431 @@ class SimulateServer:
         )
         self.start_step = start_step
 
+        # ---------- 生命循环（生死判定） ----------
+        seed = life.load_seed()
+        self.mortality_profile = life.mortality_profile()["profile"]
+        self.dice_seed = life.mortality_profile()["dice_seed"]
+        self.agent_base_age = {a["name"]: float(a["age"]) for a in seed["agents"]}
+        # 生命原点：新建时记为种子起点（或本次 --start），断点续跑沿用它，
+        # 这样抽象年龄始终连续，不会因续跑而回到 0。
+        if "life_origin" not in config:
+            config["life_origin"] = seed["world"]["start"]
+        self.life_origin = life.parse_sim_time(config["life_origin"])
+        # 生命状态随存档恢复（断点续跑不会重置病情）
+        self.life_state = {}
+        for agent_name in self.agent_status.keys():
+            saved = config["agents"].get(agent_name, {}).get("life")
+            self.life_state[agent_name] = saved or life.new_life_state()
+        # 初始婚姻关系来自种子（只在新开局时写入，之后随存档走）
+        seed_spouse = {a["name"]: a.get("spouse") for a in seed["agents"]}
+        for agent_name, state in self.life_state.items():
+            if not state.get("spouse") and seed_spouse.get(agent_name):
+                state["spouse"] = seed_spouse[agent_name]
+        self.bind_health_to_prompt()
+        # 已经过去了几个模拟日（恢复时不能重掷已判定的日子）
+        self.life_day = int(life.sim_days_elapsed(utils.get_timer().get_date(), self.life_origin))
+        self.life_events_file = f"{checkpoints_folder}/life_events.json"
+        self.life_events = []
+        if os.path.exists(self.life_events_file):
+            with open(self.life_events_file, "r", encoding="utf-8") as f:
+                self.life_events = json.load(f)
+
+        # ---------- 生育与成长 ----------
+        self.population = life.population_policy()
+        # 幼儿登记表（0~6 岁：只在侧边栏，不进模拟循环），随存档持久化
+        self.children = config.get("children", [])
+        # 性别表（从静态设定读一次；新生儿登记时写入）
+        self.agent_gender = {}
+        for agent_name in self.agent_status.keys():
+            self.agent_gender[agent_name] = self.read_gender(agent_name)
+        for child in self.children:
+            self.agent_gender[child["name"]] = child.get("gender", "")
+        self._life_llm = None
+
+    def read_gender(self, agent_name):
+        path = f"frontend/static/assets/village/agents/{agent_name}/agent.json"
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f).get("gender", "")
+        except (FileNotFoundError, json.JSONDecodeError):
+            return ""
+
+    def life_llm(self):
+        """起名 / 撰写人设专用的小 LLM 句柄（与角色同源配置）。"""
+        if self._life_llm is None:
+            from modules.model.llm_model import create_llm_model
+            self._life_llm = create_llm_model(self.config["agent_base"]["think"]["llm"])
+        return self._life_llm
+
+    # ---------- 生命循环：把健康状态暴露给 prompt ----------
+    def bind_health_to_prompt(self):
+        """把「生病/康复」写进角色的当前状态，让 LLM 自己演出卧床/虚弱的行为。"""
+        for name, state in self.life_state.items():
+            agent = self.game.agents.get(name)
+            if not agent:
+                continue
+            note = self.health_note(state)
+            agent.scratch.currently = self.strip_health(agent.scratch.currently) + note
+
+    @staticmethod
+    def health_note(state):
+        if state["health"] == life.SEVERE:
+            return "（卧床：身患重病，虚弱）"
+        if state["health"] == life.MILD:
+            return "（不适：有些小病，精神不佳）"
+        return ""
+
+    @staticmethod
+    def strip_health(text):
+        for note in ("（卧床：身患重病，虚弱）", "（不适：有些小病，精神不佳）"):
+            text = text.replace(note, "")
+        return text
+
+    def life_tick(self, timer, step=None):
+        """按模拟日推进生死判定；返回本步内发生的生命事件。"""
+        now = timer.get_date()
+        day = int(life.sim_days_elapsed(now, self.life_origin))
+        if day <= self.life_day:
+            return []
+        self.life_day = day
+        events = []
+        for name in list(self.agent_status.keys()):
+            state = self.life_state.setdefault(name, life.new_life_state())
+            base_age = self.agent_base_age.get(name, 30.0)
+            age = life.abstract_age(base_age, now, self.life_origin)
+            state, event = life.daily_roll(
+                name, age, day, state, self.mortality_profile, self.dice_seed
+            )
+            if not event:
+                continue
+            event = dict(
+                event,
+                name=name,
+                day=day,
+                step=(step or 1),
+                age=round(age, 1),
+                time=now.strftime("%Y%m%d-%H:%M"),
+            )
+            events.append(event)
+            if event["type"] == "death":
+                self.kill_agent(name, event)
+            else:
+                self.logger.info(
+                    "{} 的健康事件：{}（第 {} 模拟日，年龄 {}）".format(
+                        name, event["type"], day, event["age"]
+                    )
+                )
+                if event["type"] in ("sick", "worsen", "recover"):
+                    agent = self.game.agents.get(name)
+                    if agent:
+                        agent.scratch.currently = (
+                            self.strip_health(agent.scratch.currently)
+                            + self.health_note(state)
+                        )
+        # 生育链路：受孕 → 分娩 → 入学（同一天内推进）
+        events.extend(self.family_tick(timer, day, step))
+
+        if len(events) > 0:
+            self.life_events.extend(events)
+            self.save_life_events()
+        return events
+
+    def kill_agent(self, name, event):
+        """角色死亡：清出世界（迷宫事件、游戏循环、存档），留下墓碑事件。"""
+        agent = self.game.agents.get(name)
+        coord = list(agent.coord) if agent and agent.coord else None
+        if agent:
+            tile = agent.get_tile()
+            tile.remove_events(subject=name)
+            if tile.has_address("game_object"):
+                addr = tile.get_address("game_object")
+                self.game.maze.update_obj(
+                    agent.coord, memory.Event(addr[-1], address=addr)
+                )
+        event.update({"coord": coord, "cause": event.get("cause", "重病")})
+        self.game.agents.pop(name, None)
+        self.agent_status.pop(name, None)
+        self.config["agents"].pop(name, None)
+        self.logger.info(
+            "{} 去世了（享年 {} 岁，死因 {}，位置 {}）".format(
+                name, event["age"], event["cause"], coord
+            )
+        )
+
+    def save_life_events(self):
+        with open(self.life_events_file, "w", encoding="utf-8") as f:
+            f.write(json.dumps(self.life_events, indent=2, ensure_ascii=False))
+
+    # ---------- 生育与成长 ----------
+    def family_tick(self, timer, day, step):
+        """一个模拟日推进一次：受孕 → 分娩 → 入学。"""
+        now = timer.get_date()
+        events = []
+        alive = list(self.agent_status.keys())
+
+        # 1) 受孕：已婚、女方在世且在育龄窗口、未孕、未达人口上限
+        for name in alive:
+            state = self.life_state.get(name)
+            if state is None or state["health"] == life.DEAD:
+                continue
+            if self.agent_gender.get(name) != "女":
+                continue
+            if state.get("pregnant_by") or not state.get("spouse"):
+                continue
+            spouse = state["spouse"]
+            if spouse not in self.agent_status:
+                continue  # 配偶已故
+            age = life.abstract_age(self.agent_base_age.get(name, 30.0), now, self.life_origin)
+            if not life.can_conceive(age, self.population):
+                continue
+            if (len(self.agent_status) + len(self.children)) >= self.population["cap"]:
+                continue
+            if not life.birth_chance_ok(self.life_events, day, self.population["births_per_year"]):
+                continue
+            if life.conception_roll(spouse, name, day, self.dice_seed) < life.conception_chance(age):
+                state["pregnant_by"] = spouse
+                state["due_day"] = day + self.population["pregnancy_days"]
+                event = {
+                    "type": "conceive", "name": name, "spouse": spouse,
+                    "day": day, "step": step, "age": round(age, 1),
+                    "time": now.strftime("%Y%m%d-%H:%M"),
+                }
+                events.append(event)
+                self.logger.info("{} 有了身孕（{} 的孩子）".format(name, spouse))
+
+        # 2) 分娩
+        for name in alive:
+            state = self.life_state.get(name)
+            if not state or not state.get("pregnant_by"):
+                continue
+            if day < state.get("due_day", 0):
+                continue
+            event = self.give_birth(name, state, day, step, now)
+            if event:
+                events.append(event)
+
+        # 3) 入学：幼儿长到 school_age 转为完整角色
+        for child in list(self.children):
+            age = life.child_age(child, day)
+            if age < self.population["school_age"]:
+                continue
+            self.enroll_child(child, day, step, now)
+            events.append({
+                "type": "enroll", "name": child["name"], "day": day, "step": step,
+                "age": round(age, 1), "time": now.strftime("%Y%m%d-%H:%M"),
+            })
+
+        if len(events) > 0:
+            self.life_events.extend(events)
+            self.save_life_events()
+        return events
+
+    def give_birth(self, mother_name, state, day, step, now):
+        """分娩：起名（姓氏随父）→ 登记幼儿 → 继承父母贴图。"""
+        father_name = state["pregnant_by"]
+        gender = "女" if life._rng(self.dice_seed, "gender:" + mother_name, day).random() < 0.5 else "男"
+        base_age = life.abstract_age(self.agent_base_age.get(mother_name, 30.0), now, self.life_origin)
+
+        name = self.generate_child_name(father_name, mother_name, gender, base_age)
+        if not name or name in self.agent_status or any(c["name"] == name for c in self.children):
+            name = self.fallback_child_name(father_name)
+
+        texture_from = mother_name if self.agent_gender.get(mother_name) == gender else father_name
+        if texture_from not in self.agent_status:
+            texture_from = mother_name
+        home = self.child_home(mother_name, father_name)
+
+        record = life.new_child_record(
+            name, gender, [father_name, mother_name], day,
+            (step - 1) * 60 + 1, texture_from, home,
+        )
+        self.children.append(record)
+        self.agent_gender[name] = gender
+        self.write_child_assets(record)
+
+        state["pregnant_by"] = ""
+        state["due_day"] = 0.0
+        state["births"] = state.get("births", 0) + 1
+        father_state = self.life_state.get(father_name)
+        if father_state is not None:
+            father_state["births"] = father_state.get("births", 0) + 1
+
+        self.logger.info(
+            "{} 生下了{}：{}（父亲 {}）".format(mother_name, gender, name, father_name)
+        )
+        home_coord = self.game.agents[mother_name].coord if mother_name in self.game.agents else None
+        return {
+            "type": "birth", "name": name, "gender": gender,
+            "parents": [father_name, mother_name],
+            "day": day, "step": step, "frame": record["birth_frame"],
+            "coord": list(home_coord) if home_coord else None,
+            "age": 0.0, "time": now.strftime("%Y%m%d-%H:%M"),
+        }
+
+    def generate_child_name(self, father_name, mother_name, gender, base_age):
+        """LLM 起名：姓氏随父；失败则退回默认名。"""
+        existing = list(self.agent_status.keys()) + [c["name"] for c in self.children]
+        try:
+            prompt_text = life.child_name_prompt(father_name, mother_name, gender, existing)
+            text = self.life_llm().completion(prompt_text, retry=3, caller="life_name")
+            if text:
+                name = text.strip().splitlines()[0].strip().strip("。.，,、\"'“”")
+                if 2 <= len(name) <= 4:
+                    return name
+        except Exception as e:
+            self.logger.info("起名失败，使用备用名：{}".format(e))
+        return ""
+
+    def fallback_child_name(self, father_name):
+        """LLM 不可用时的备用名：姓氏随父 + 常用字。"""
+        surname = father_name[0] if father_name else "小"
+        pool = ["安", "宁", "禾", "苗", "星", "舟", "然", "一", "乐", "和", "平", "嘉"]
+        i = 0
+        while True:
+            name = "{}{}".format(surname, pool[i % len(pool)])
+            if name not in self.agent_status and all(c["name"] != name for c in self.children):
+                return name
+            i += 1
+
+    def child_home(self, mother_name, father_name):
+        """孩子住在母亲（或父亲）的住所。"""
+        for who in (mother_name, father_name):
+            path = f"frontend/static/assets/village/agents/{who}/agent.json"
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    return json.load(f)["spatial"]["address"]["living_area"]
+            except (FileNotFoundError, json.JSONDecodeError, KeyError):
+                continue
+        return ["the Ville"]
+
+    def write_child_assets(self, child):
+        """给新生儿准备一张立绘与贴图（继承自父/母）。"""
+        dst = f"frontend/static/assets/village/agents/{child['name']}"
+        src = f"frontend/static/assets/village/agents/{child['texture_from']}"
+        if os.path.isdir(dst):
+            return
+        os.makedirs(dst, exist_ok=True)
+        for fname in ("portrait.png", "texture.png"):
+            if os.path.exists(os.path.join(src, fname)):
+                shutil.copyfile(os.path.join(src, fname), os.path.join(dst, fname))
+
+    def enroll_child(self, child, day, step, now):
+        """入学转正：撰写人设 → 建档 → 加入模拟循环。"""
+        name = child["name"]
+        father, mother = (child["parents"] + ["", ""])[:2]
+        scratch = self.generate_child_persona(child, father, mother)
+
+        home = child["home"]
+        # 优先站在母亲（或父亲）身边——孩子本就住在家里，这样也不会落到壁橱之类的格子上
+        parent = next((p for p in (mother, father) if p in self.game.agents), None)
+        if parent:
+            coord = list(self.game.agents[parent].coord)
+        else:
+            tiles = sorted(self.game.maze.get_address_tiles(home))  # 返回的是 set，排序后取整
+            coord = list(tiles[0]) if tiles else [0, 0]
+
+        asset_dir = f"frontend/static/assets/village/agents/{name}"
+        if not os.path.isdir(asset_dir):
+            os.makedirs(asset_dir, exist_ok=True)
+            for fname in ("portrait.png", "texture.png"):
+                src = f"frontend/static/assets/village/agents/{child['texture_from']}/{fname}"
+                if os.path.exists(src):
+                    shutil.copyfile(src, os.path.join(asset_dir, fname))
+        asset_path = os.path.join(asset_dir, "agent.json")
+        payload = {
+            "name": name,
+            "portrait": "assets/village/agents/{}/portrait.png".format(name),
+            "gender": child["gender"],
+            "coord": coord,
+            "currently": "{}刚满六岁，今天是入学的第一天。".format(name),
+            "scratch": {
+                "age": int(self.population["school_age"]),
+                "innate": scratch["innate"],
+                "learned": scratch["learned"],
+                "lifestyle": scratch["lifestyle"],
+                "daily_plan": scratch["daily_plan"],
+            },
+            "spatial": {
+                "address": {"living_area": home},
+                "tree": self.child_spatial_tree(father, mother, home),
+            },
+        }
+        with open(asset_path, "w", encoding="utf-8") as f:
+            f.write(json.dumps(payload, indent=2, ensure_ascii=False))
+
+        # 加入游戏
+        from modules.agent import Agent
+        agent_base = self.config.get("agent_base", {})
+        agent_config = utils.update_dict(copy.deepcopy(agent_base), payload)
+        agent_config["storage_root"] = os.path.join(
+            f"results/checkpoints/{self.name}", "storage", name
+        )
+        agent = Agent(agent_config, self.game.maze, self.game.conversation, self.logger)
+        agent.reset()
+        self.game.agents[name] = agent
+
+        self.config["agents"][name] = {"config_path": os.path.join("assets", "village", "agents", name, "agent.json")}
+        self.agent_status[name] = {"coord": coord, "path": []}
+        self.agent_base_age[name] = float(self.population["school_age"])
+        state = life.new_life_state()
+        state["parents"] = [father, mother]
+        self.life_state[name] = state
+        self.children.remove(child)
+
+        self.logger.info("{} 入学了，成为小镇的正式居民".format(name))
+
+    def generate_child_persona(self, child, father, mother):
+        """LLM 依父母撰写人设；失败则用父母的混搭兜底。"""
+        def scratch_of(who):
+            path = f"frontend/static/assets/village/agents/{who}/agent.json"
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    return json.load(f)["scratch"]
+            except (FileNotFoundError, json.JSONDecodeError, KeyError):
+                return {}
+
+        f_scratch, m_scratch = scratch_of(father), scratch_of(mother)
+        try:
+            prompt_text = life.child_persona_prompt(
+                child["name"], child["gender"], father, mother, f_scratch, m_scratch
+            )
+            text = self.life_llm().completion(prompt_text, retry=3, caller="life_persona")
+            parsed = life.parse_child_persona(text, fallback_innate=f_scratch.get("innate", "好奇、温和"))
+            if parsed.get("learned"):
+                return parsed
+        except Exception as e:
+            self.logger.info("撰写人设失败，使用兜底：{}".format(e))
+        merged = [f_scratch.get("innate", ""), m_scratch.get("innate", "")]
+        return {
+            "innate": "、".join([x for x in merged if x]) or "好奇、温和",
+            "learned": "在{}和{}身边长大。".format(father, mother),
+            "lifestyle": m_scratch.get("lifestyle", "作息规律。"),
+            "daily_plan": "白天去学校上课，放学后回家。",
+        }
+
+    def child_spatial_tree(self, father, mother, home):
+        """孩子的空间认知：继承父母的（同一座小镇，房间地址一致）。"""
+        for who in (mother, father):
+            path = f"frontend/static/assets/village/agents/{who}/agent.json"
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    return json.load(f)["spatial"]["tree"]
+            except (FileNotFoundError, json.JSONDecodeError, KeyError):
+                continue
+        return {}
+
     def simulate(self, step, stride=0):
         timer = utils.get_timer()
         for i in range(self.start_step, self.start_step + step):
             title = "Simulate Step[{}/{}, time: {}]".format(i+1, self.start_step + step, timer.get_date())
             self.logger.info("\n" + utils.split_line(title, "="))
+
+            # 生命循环：跨模拟日时判定发病/痊愈/死亡（全灭则自动结束）
+            self.life_tick(timer, step=i + 1)
+            if len(self.agent_status) < 1:
+                self.logger.info("\n" + utils.split_line("小镇已无居民，模拟结束", "="))
+                break
+
             step_start = time.time()
             if self.parallel > 1:
                 # 阶段化并行：LLM 密集且只碰角色私有状态的阶段走线程池
@@ -97,12 +513,17 @@ class SimulateServer:
                     # {"coord": status["coord"], "path": plan["path"]}
                     {"coord": status["coord"]}
                 )
+                # 生命状态随存档持久化（断点续跑时不会重置病情）
+                if name in self.life_state:
+                    self.config["agents"][name]["life"] = self.life_state[name]
 
             sim_time = timer.get_date("%Y%m%d-%H:%M")
             self.config.update(
                 {
                     "time": sim_time,
                     "step": i + 1,
+                    # 幼儿登记表随存档持久化（0~6 岁不进模拟循环，只作被照顾对象）
+                    "children": self.children,
                 }
             )
             # 保存Agent活动数据

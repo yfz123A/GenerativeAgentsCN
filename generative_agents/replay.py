@@ -12,8 +12,7 @@ from flask import Flask, render_template, request, jsonify
 # 为避免 replay.py 自己的启动参数被它们误解析，import 之前先把 argv 收干净。
 _argv_backup = sys.argv
 sys.argv = sys.argv[:1]
-from compress import frames_per_step, file_movement, MovementBuilder
-from start import personas
+from compress import frames_per_step, file_movement, life_events_file, MovementBuilder
 sys.argv = _argv_backup
 
 
@@ -107,7 +106,7 @@ waiting_page = """<!DOCTYPE html>
 </head>
 <body style="font-family: sans-serif; padding: 3em; text-align: center; color: #333;">
   <h2>『{name}』正在初始化</h2>
-  <p>第一步需要为 25 位居民生成完整日程，通常约 8 分钟。</p>
+  <p>第一步需要为全体居民生成完整日程，大约几分钟。</p>
   <p>本页每 10 秒会自动重试，无需手动刷新。</p>
 </body>
 </html>"""
@@ -169,6 +168,15 @@ class LiveSession:
                         self.conversation = json.load(f)
                 except (json.JSONDecodeError, OSError):
                     pass  # 模拟进程可能正在写入，下一轮再取
+
+            # 生命事件（死亡/出生）：也逐步累积，用于花名册与墓碑
+            life_path = os.path.join(self.checkpoints_folder, life_events_file)
+            if os.path.exists(life_path):
+                try:
+                    with open(life_path, "r", encoding="utf-8") as f:
+                        self.builder.add_life_events(json.load(f))
+                except (json.JSONDecodeError, OSError):
+                    pass
 
             for file_name in new_files:
                 path = os.path.join(self.checkpoints_folder, file_name)
@@ -250,18 +258,23 @@ class LiveSession:
             "frames": frames,
             "conversation": self.builder.all_movement["conversation"],
             "description": self.builder.all_movement["description"],
+            "roster": self.builder.roster(),
             "latest_frame": self.latest_frame,
             "avg_step_ms": self.avg_step_ms,
             "status": self.status,
         }
 
     def spawn_positions(self, target_step):
-        """「跳到最新」时人物的落点：取该步内每个 Agent 的第一个已知坐标，
-        避免首屏出现「从旧位置走过去」的穿墙瞬移。"""
+        """首屏人物的落点：取该步内每个角色的第一个已知坐标，避免「从旧位置走过去」。
+
+        所有「存在过」的角色都会给一个落点（含中途出生、入学、已故者）：
+        前端先按名单建好精灵，再由 apply_roster 按帧号决定显隐——已故者因此
+        能正确地「在首屏就是墓碑」或「随播放进度变为墓碑」。
+        """
         start = (target_step - 1) * frames_per_step + 1
         end = target_step * frames_per_step
         positions = {}
-        for agent in personas:
+        for agent, entry in self.builder.roster().items():
             coord = None
             for frame_no in range(start, end + 1):
                 frame = self.builder.all_movement.get(str(frame_no))
@@ -272,6 +285,8 @@ class LiveSession:
                 frame0 = self.builder.all_movement.get("0", {})
                 if agent in frame0:
                     coord = frame0[agent]["movement"]
+            if coord is None:
+                coord = self.builder.first_seen_coord(agent) or entry.get("coord")
             if coord is not None:
                 positions[agent] = coord
         return positions
@@ -304,6 +319,7 @@ class LiveSession:
             "stride": self.builder.stride,
             "sec_per_step": self.builder.stride,
             "persona_init_pos": self.spawn_positions(target_step),
+            "roster": self.builder.roster(),
             "all_movement": dict(
                 frames,
                 description=self.builder.all_movement["description"],
@@ -334,6 +350,14 @@ def load_recording(name):
         return None
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
+
+
+def sidebar_names(params):
+    """侧边栏花名册：列出所有存在过的角色（含已故）；缺 roster 的老录像退回初始位置名单。"""
+    roster = params.get("roster") or {}
+    if len(roster) > 0:
+        return list(roster.keys())
+    return list(params["persona_init_pos"].keys())
 
 
 def broadcast_meta(params):
@@ -403,7 +427,7 @@ def index():
                     f"<br />先跑：python compress.py --name {name}")
         return render_template(
             "index.html",
-            persona_names=personas,
+            persona_names=sidebar_names(params),
             step=1,
             play_speed=2 ** 2,
             zoom=zoom,
@@ -457,7 +481,7 @@ def index():
 
         return render_template(
             "index.html",
-            persona_names=personas,
+            persona_names=sidebar_names(params),
             step=params["step"],
             play_speed=2 ** speed,
             zoom=zoom,
@@ -474,6 +498,7 @@ def index():
             stride=params["stride"],
             sec_per_step=params["sec_per_step"],
             persona_init_pos=params["persona_init_pos"],
+            roster=params.get("roster", {}),
             all_movement=params["all_movement"],
         )
 
@@ -496,11 +521,17 @@ def index():
         if step >= len(params["all_movement"]):
             step = len(params["all_movement"])-1
 
-        # 重新设置Agent的初始位置
-        for agent in params["persona_init_pos"].keys():
-            persona_init_pos = params["persona_init_pos"]
-            persona_step_pos = params["all_movement"][f"{step}"]
-            persona_init_pos[agent] = persona_step_pos[agent]["movement"]
+        # 重新设置Agent的初始位置：该步在场上的人用当前坐标，
+        # 其余（未出生 / 已故 / 婴幼儿）沿用花名册里的坐标——
+        # 前端会按帧号决定显隐，所以名单不能剔除。
+        persona_init_pos = params["persona_init_pos"]
+        persona_step_pos = params["all_movement"][f"{step}"]
+        roster = params.get("roster") or {}
+        for agent in list(persona_init_pos.keys()):
+            if agent in persona_step_pos:
+                persona_init_pos[agent] = persona_step_pos[agent]["movement"]
+            elif roster.get(agent, {}).get("coord"):
+                persona_init_pos[agent] = roster[agent]["coord"]
 
     if speed < 0:
         speed = 0
@@ -510,7 +541,7 @@ def index():
 
     return render_template(
         "index.html",
-        persona_names=personas,
+        persona_names=sidebar_names(params),
         step=step,
         play_speed=speed,
         zoom=zoom,

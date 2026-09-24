@@ -79,6 +79,134 @@
 	let execute_count_max = tile_width / movement_speed;
 	let execute_count = execute_count_max;
 	let all_movement = {{ all_movement|tojson }};
+	// 花名册：每个角色的存在区间（first_frame/last_frame）与生死信息
+	let roster = {{ roster|default({})|tojson }};
+
+	// 某个角色在第 frame 帧是否在世（含尚未出生）
+	function roster_alive(name, frame) {
+		let r = roster[name];
+		if (!r) return true;                       // 无花名册信息（老录像）：按在世处理
+		if (r.born_frame !== undefined && frame < r.born_frame) return false;    // 尚未出生
+		if (r.first_frame !== undefined && frame < r.first_frame) return false;  // 婴幼儿：还没入学
+		if (r.last_frame !== undefined && frame > r.last_frame) return false;    // 已过世
+		return true;
+	}
+
+	// 是否已经出生（婴幼儿虽不在地图上，但应从出生起出现在侧边栏）
+	function roster_born(name, frame) {
+		let r = roster[name];
+		if (!r) return true;
+		if (r.born_frame !== undefined && frame < r.born_frame) return false;
+		return true;
+	}
+
+	// 四态：unborn（未出生）/ infant（已出生但未入学，不在地图上）/ alive / dead
+	function roster_state(name, frame) {
+		let r = roster[name];
+		if (!r) return "alive";                       // 老录像：按在世处理
+		if (r.born_frame !== undefined && frame < r.born_frame) return "unborn";
+		if (r.last_frame !== undefined && frame > r.last_frame) return "dead";
+		if (r.first_frame !== undefined && frame < r.first_frame) return "infant";
+		return "alive";
+	}
+
+	let tombstones = {};        // 墓碑（按需创建）
+	let dead_state = {};        // 记录上一次的生死状态，避免每帧重复处理
+	let scene_ref = null;       // create() 里记下场景，供立碑时创建对象
+
+	// 按花名册刷新画面：四态处理（未出生隐藏 / 婴幼儿只在侧边栏 / 在世 / 已故立碑）
+	function apply_roster(frame_no) {
+		for (let name in roster) {
+			let state = roster_state(name, frame_no);
+			if (dead_state[name] === state) continue;
+			dead_state[name] = state;
+
+			let on_map = (state === "alive");
+			let persona = personas[name];
+			let pronunciation = pronunciatios[name];
+			if (persona) persona.setVisible(on_map);
+			if (pronunciation) pronunciation.setVisible(on_map);
+			// 侧边栏：未出生隐藏，婴幼儿（未入学）显示但标注，已故灰显
+			mark_sidebar_state(name, roster[name] || {}, state, frame_no);
+
+			let r = roster[name] || {};
+			if (state === "dead") {
+				// 出场时已过世的角色（首屏就没有精灵）：用花名册里的坐标立碑
+				let px = null, py = null;
+				if (persona) {
+					px = persona.body.x;
+					py = persona.body.y;
+				} else if (r.coord) {
+					px = r.coord[0] * tile_width;
+					py = r.coord[1] * tile_width;
+				}
+				if (r.last_frame !== undefined && frame_no > r.last_frame && scene_ref && px !== null) {
+					if (!tombstones[name]) {
+						tombstones[name] = scene_ref.add.text(px - 8, py - 34, "🪦", { font: "28px monospace" });
+						tombstones[name].setDepth(3);
+						let info = name + "（已故";
+						if (r.age_at_death) info += "，享年 " + Math.round(r.age_at_death) + " 岁";
+						if (r.died_of) info += "，" + r.died_of;
+						info += "）";
+						tombstones[name + "-label"] = scene_ref.add.text(px - 60, py - 60, info, {
+							font: "16px monospace", fill: "#333333", backgroundColor: "#DDDDDD",
+							padding: { x: 4, y: 2 },
+						});
+						tombstones[name + "-label"].setDepth(3);
+					} else {
+						tombstones[name].setVisible(true);
+						tombstones[name + "-label"].setVisible(true);
+					}
+				}
+			} else if (tombstones[name]) {
+				tombstones[name].setVisible(false);
+				tombstones[name + "-label"].setVisible(false);
+			}
+		}
+	}
+
+	// 侧边栏四态：unborn 隐藏 / infant 标注 / alive 复原 / dead 灰显并标注享年
+	function mark_sidebar_state(name, r, state, frame_no) {
+		let trigger = document.getElementById("on_screen_det_trigger-" + name);
+		if (!trigger) return;
+		let container = trigger.parentElement;
+		if (state === "unborn") {
+			if (container) container.style.display = "none";
+			// 清掉可能残留的旧标注，并记录状态（循环播放回到出生前时用得上）
+			let stale = document.getElementById("life_mark__" + name);
+			if (stale && stale.parentNode) stale.parentNode.removeChild(stale);
+			trigger.dataset.mark = state;
+			return;
+		}
+		if (container) container.style.display = "";
+		// 状态切换时先清掉旧标注（循环播放会来回切）
+		if (trigger.dataset.mark !== state && trigger.dataset.mark) {
+			let old = document.getElementById("life_mark__" + name);
+			if (old && old.parentNode) old.parentNode.removeChild(old);
+			trigger.style.opacity = "";
+		}
+		trigger.dataset.mark = state;
+		let text = "";
+		let color = "#888888";
+		if (state === "dead") {
+			trigger.style.opacity = 0.45;
+			text = "（已故";
+			if (r.age_at_death) text += "，享年 " + Math.round(r.age_at_death) + " 岁";
+			if (r.died_of) text += "，" + r.died_of;
+			text += "）";
+		} else if (state === "infant") {
+			text = "（婴幼儿，由父母照看）";
+			color = "#88aa88";
+		}
+		if (text && !document.getElementById("life_mark__" + name)) {
+			let span = document.createElement("span");
+			span.style.fontSize = "0.8em";
+			span.style.color = color;
+			span.id = "life_mark__" + name;
+			span.textContent = text;
+			trigger.appendChild(span);
+		}
+	}
 
 	// 按倍率计算每个数据帧的停留时长：
 	// 目标 = 基准步耗时 / 倍率 / 每步帧数，再换算成 Phaser 的渲染帧数（约 60fps）
@@ -181,7 +309,10 @@
 		// Load tilemap JSON
 		this.load.tilemapTiledJSON("map", "static/assets/village/tilemap/tilemap.json");
 
-		this.load.atlas("atlas", "static/assets/village/agents/伊莎贝拉/texture.png", filename="static/assets/village/agents/sprite.json");
+		// 玩家本体（相机跟随的隐形精灵）：贴图取花名册里的第一个角色，
+		// 不再写死某个名字（花名册已由种子/存档数据驱动）
+		let player_texture = Object.keys(persona_names)[0];
+		this.load.atlas("atlas", "static/assets/village/agents/" + player_texture + "/texture.png", filename="static/assets/village/agents/sprite.json");
 
 		// Load persona atlases
 		for (var p in persona_names) {
@@ -192,6 +323,7 @@
 
 	// Create function
 	function create() {
+		scene_ref = this;
 		const map = this.make.tilemap({ key: "map" });
 
 		// Add tilesets and layers
@@ -489,12 +621,17 @@
 			textConversation.setText(`\n${conversation_key} 对话记录：\n` + conversation_key_text);
 		}
 
+		// 按花名册刷新：亡者隐去并立碑（在移动之前处理）
+		apply_roster(step);
+
 		// Moving personas
 		waiting_data = false;
 		for (let i = 0; i < Object.keys(personas).length; i++) {
 			let curr_persona_name = Object.keys(personas)[i];
 			let curr_persona = personas[curr_persona_name];
 			let curr_pronunciatio = pronunciatios[Object.keys(personas)[i]];
+
+			if (!roster_alive(curr_persona_name, step)) continue;   // 已故/未出生：不参与走位
 
 			if (step in all_movement) {
 				if (curr_persona_name.replace("_", " ") in all_movement[step]) {
@@ -682,10 +819,15 @@
 		let frame_changed = (frame != bc_last_frame);
 		let step_changed = (step != bc_last_step);
 
+		// 按花名册刷新：亡者隐去并立碑（直播台走帧号，与回放同一套逻辑）
+		apply_roster(frame);
+
 		for (let i = 0; i < Object.keys(personas).length; i++) {
 			let agent = Object.keys(personas)[i];
 			let persona = personas[agent];
 			let key = agent.replace("_", " ");
+
+			if (!roster_alive(agent, frame)) continue;   // 已故/未出生：不参与走位
 
 			// 查表：这一帧从 frame-1 格走到 frame 格（表里已把「该步没走动」的帧补成上一格）
 			let table = bc_pos[agent];
