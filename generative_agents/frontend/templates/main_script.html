@@ -20,23 +20,58 @@
 
 {% if is_broadcast %}
 	// ---------- 直播台 ----------
-	// 画面内容 = f(当前时间)。所有观众用同一个公式算出同一个帧号，
-	// 因此不需要服务端推送：卡顿、后台标签页、时钟漂移都会自动纠正。
-	let anchor_ms = {{ anchor_ms|tojson }};                        // 固定的轮内纪元
-	let ms_per_frame = {{ ms_per_frame|tojson }};                  // 每个数据帧占用的真实毫秒
-	let total_frames = {{ total_frames|tojson }};                  // 一轮的总帧数
-	let total_steps = {{ total_steps|tojson }};                    // 一轮的总步数
-	let cycle_ms = ms_per_frame * total_frames;                    // 一轮的真实时长
-	let min_per_step = {{ stride|tojson }};                        // 每步对应多少模拟分钟
-	let clock_offset_ms = {{ server_now_ms|tojson }} - Date.now(); // 服务端时间 - 本地时间
-	function server_now_ms() { return Date.now() + clock_offset_ms; }
+	// 画面内容 = f(全场虚拟时间)。虚拟时间的基准由服务端下发（主播全局控制：
+	// 任何人暂停/变速，全场一起变），本地只做两次轮询之间的平滑外推。
+	let anchor_ms = {{ anchor_ms|tojson }};       // 固定的轮内纪元
+	let ms_per_frame = {{ ms_per_frame|tojson }}; // 每个数据帧占用的真实毫秒
+	let total_frames = {{ total_frames|tojson }}; // 一轮的总帧数
+	let total_steps = {{ total_steps|tojson }};   // 一轮的总步数
+	let cycle_ms = ms_per_frame * total_frames;   // 一轮的真实时长
+	let min_per_step = {{ stride|tojson }};       // 每步对应多少模拟分钟
 
-	// 每 60 秒用服务端时间重新校正一次本地时钟（防止本地时钟本身不准或漂移）
+	// 全场时间轴的本地镜像
+	let bc_vbase = {{ server_now_ms|tojson }};    // 最后一次轮询到的服务端虚拟时刻
+	let bc_poll_wall = Date.now();                // 那次轮询发生时的本地时钟
+	let bc_rate = 1.0;
+	let bc_paused = false;
+	let bc_rate_buttons = {};                     // 1x/2x/3x 按钮（create() 里创建）
+
+	// 全场虚拟时刻：暂停时冻结；否则按倍率从上次轮询点外推（确定性，无累积误差）
+	function server_now_ms() {
+		return bc_paused ? bc_vbase : bc_vbase + (Date.now() - bc_poll_wall) * bc_rate;
+	}
+
+	// 按钮文案/高亮跟随全场状态。create() 之前这些按钮还不存在，故做空值保护
+	function refresh_bc_buttons() {
+		if (typeof buttonPause !== "undefined" && buttonPause) {
+			buttonPause.text = bc_paused ? " 继续 " : " 暂停 ";
+		}
+		for (let r in bc_rate_buttons) {
+			bc_rate_buttons[r].setBackgroundColor(Number(r) === bc_rate ? "#aaffaa" : "#ffffcc");
+		}
+	}
+
+	// 应用一次服务端状态（轮询或控制接口的返回都会走这里）
+	function bc_apply_state(d) {
+		if (!d || d.virtual_ms === undefined) return;
+		bc_vbase = d.virtual_ms;
+		bc_poll_wall = Date.now();
+		bc_paused = !!d.paused;
+		bc_rate = d.rate > 0 ? d.rate : 1;
+		refresh_bc_buttons();
+	}
+
+	// 控制指令：发给服务端，服务端返回新状态后立即应用（乐观更新 + 2 秒轮询兜底）
+	function bc_cmd(path) {
+		fetch(path).then(function (r) { return r.json(); }).then(bc_apply_state).catch(function () {});
+	}
+
+	bc_apply_state({ virtual_ms: {{ server_now_ms|tojson }}, paused: false, rate: 1 });
+
+	// 每 2 秒对齐一次全场时间轴：任何人的暂停/变速最多 2 秒内传到所有人
 	setInterval(function () {
-		fetch("/now").then(function (r) { return r.json(); }).then(function (d) {
-			if (d && d.server_now_ms) clock_offset_ms = d.server_now_ms - Date.now();
-		}).catch(function () {});
-	}, 60000);
+		fetch("/now").then(function (r) { return r.json(); }).then(bc_apply_state).catch(function () {});
+	}, 2000);
 {% endif %}
 
 	let tile_width = 32;
@@ -231,14 +266,21 @@
 		posY = 20;
 
 {% if not is_broadcast %}
-		// Add button: play, pause ...
-		// （直播台不提供运行/暂停：任何一个人暂停都会立刻脱离共同时间轴）
+		// Add button: play, pause ...（录播/实时模式）
 		buttonPlay = add_text(this, posX, posY, "[运行]", "#ffffcc");
 		buttonPlay.setInteractive();
 		posX += buttonPlay.width + 10;
 
 		buttonPause = add_text(this, posX, posY, " 暂停 ", "#ffffcc");
 		buttonPause.setInteractive();
+		posX += buttonPause.width + 10;
+{% else %}
+		// 直播台：全场暂停（主播全局控制，对所有观众生效）
+		buttonPause = add_text(this, posX, posY, " 暂停 ", "#ffffcc");
+		buttonPause.setInteractive();
+		buttonPause.on("pointerdown", function () {
+			bc_cmd(bc_paused ? "/bc/resume" : "/bc/pause");
+		});
 		posX += buttonPause.width + 10;
 {% endif %}
 
@@ -251,8 +293,7 @@
 		posX += buttonHideConversation.width + 10;
 
 {% if not is_broadcast %}
-		// 倍率切换：一步的播放时长 = 基准步耗时 / 倍率
-		// （直播台的节奏由服务端常量决定，观众改不了）
+		// 倍率切换：一步的播放时长 = 基准步耗时 / 倍率（仅本机生效）
 		k_buttons = {};
 		function refresh_k_buttons() {
 			for (let rate in k_buttons) {
@@ -272,6 +313,17 @@
 			posX += btn.width + 6;
 		});
 		refresh_k_buttons();
+{% else %}
+		// 直播台倍率：全场变速（相位保持，不跳帧）
+		bc_rate_buttons = {};
+		[1, 2, 3].forEach((rate) => {
+			let btn = add_text(this, posX, posY, " " + rate + "x ", "#ffffcc");
+			btn.setInteractive();
+			btn.on("pointerdown", () => { bc_cmd("/bc/rate?r=" + rate); });
+			bc_rate_buttons[rate] = btn;
+			posX += btn.width + 6;
+		});
+		refresh_bc_buttons();
 {% endif %}
 
 		// Show current time
@@ -578,6 +630,7 @@
 	// ---------- 直播台：帧号完全由时间推出，帧内按毫秒插值 ----------
 	let bc_last_frame = -1;
 	let bc_last_step = -1;
+	let bc_last_status = "";
 
 	// 某角色在第 frame_no 帧的格子；该帧没有这个角色（没走动）时返回 null
 	function bc_coord(agent_name, frame_no) {
@@ -680,7 +733,7 @@
 			}
 		}
 
-		// 时钟、对话记录、节目单：都与当前步严格对应（顺带修掉「每步只走 10 秒」）
+		// 时钟、对话记录：与当前步严格对应（顺带修掉「每步只走 10 秒」）
 		if (step_changed) {
 			bc_last_step = step;
 			let cur_time = new Date(start_datetime.getTime() + min_per_step * 60000 * (step - 1));
@@ -690,7 +743,13 @@
 			if (conv !== undefined && conv !== "") {
 				textConversation.setText(`\n${conv_key} 对话记录：\n` + conv);
 			}
-			statusText.setText(`第 ${step}/${total_steps} 步`);
+		}
+
+		// 节目单 + 全场状态：暂停是全场事件，必须即时反映（不能等步变化）
+		let status = bc_paused ? "已暂停（全场）" : `第 ${step}/${total_steps} 步`;
+		if (status !== bc_last_status) {
+			bc_last_status = status;
+			statusText.setText(status);
 		}
 		bc_last_frame = frame;
 	}

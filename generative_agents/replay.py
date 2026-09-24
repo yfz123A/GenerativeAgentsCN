@@ -42,6 +42,61 @@ broadcast_anchor_ms = 1767225600000  # 2026-01-01T00:00:00Z
 # 每个 step 占用的真实毫秒数：1 分钟/步，即模拟时间以 10 倍速前进
 broadcast_ms_per_step = 60 * 1000
 
+# ---------- 直播台的全场虚拟时钟（主播全局控制：暂停/倍率对所有人生效）----------
+# 只存最小状态；任何操作都先重算基准再改状态，保证暂停/恢复/变速都不会引起画面跳变。
+# 重启即回到直播边：倍率回 1x、取消暂停，相位重新由墙钟决定（与无按钮时一致）。
+_bc_lock = threading.RLock()
+_bc = {"paused": False, "rate": 1.0, "vbase": 0.0, "wbase": 0.0}
+
+
+def _bc_init():
+    """初始化：虚拟时刻 == 墙钟时刻（1x、不暂停）"""
+    now = time.time() * 1000
+    _bc["vbase"] = now
+    _bc["wbase"] = now
+
+
+def _bc_virtual(now_ms=None):
+    """当前的全场虚拟时刻（毫秒，与 broadcast_anchor_ms 同一坐标系）"""
+    with _bc_lock:
+        if _bc["paused"]:
+            return _bc["vbase"]
+        if now_ms is None:
+            now_ms = time.time() * 1000
+        return _bc["vbase"] + (now_ms - _bc["wbase"]) * _bc["rate"]
+
+
+def _bc_rebase(now_ms):
+    """把基准挪到当前虚拟时刻；之后的改状态操作就不会让画面跳变"""
+    _bc["vbase"] = _bc_virtual(now_ms)
+    _bc["wbase"] = now_ms
+
+
+def _bc_snapshot():
+    return {"virtual_ms": _bc_virtual(), "paused": _bc["paused"], "rate": _bc["rate"]}
+
+
+def bc_pause():
+    with _bc_lock:
+        _bc_rebase(time.time() * 1000)
+        _bc["paused"] = True
+        return _bc_snapshot()
+
+
+def bc_resume():
+    with _bc_lock:
+        _bc_rebase(time.time() * 1000)
+        _bc["paused"] = False
+        return _bc_snapshot()
+
+
+def bc_set_rate(rate):
+    with _bc_lock:
+        _bc_rebase(time.time() * 1000)
+        _bc["rate"] = rate
+        return _bc_snapshot()
+
+
 # 模拟刚启动、还没产出第一步时展示的等待页（会自动重试）
 waiting_page = """<!DOCTYPE html>
 <html lang="zh-CN">
@@ -292,10 +347,37 @@ def broadcast_meta(params):
     }
 
 
+_bc_init()   # 模块加载时初始化全场虚拟时钟（虚拟时刻 == 墙钟时刻）
+
+
 @app.route("/now", methods=['GET'])
 def now():
-    """直播台客户端用它校正本地时钟：返回服务端当前的毫秒时间戳"""
-    return jsonify({"server_now_ms": int(time.time() * 1000)})
+    """直播台客户端对齐全场时间轴用：返回服务端虚拟时刻与全场播放状态"""
+    return jsonify(dict(_bc_snapshot(), server_now_ms=int(time.time() * 1000)))
+
+
+@app.route("/bc/pause", methods=['POST', 'GET'])
+def bc_pause_route():
+    """全场暂停（对所有观众生效）"""
+    return jsonify(bc_pause())
+
+
+@app.route("/bc/resume", methods=['POST', 'GET'])
+def bc_resume_route():
+    """全场恢复播放"""
+    return jsonify(bc_resume())
+
+
+@app.route("/bc/rate", methods=['POST', 'GET'])
+def bc_rate_route():
+    """全场变速（相位保持，不跳帧）。用法：/bc/rate?r=2"""
+    try:
+        rate = float(request.args.get("r", 1))
+    except (TypeError, ValueError):
+        return jsonify({"error": "rate 必须是数字，例如 /bc/rate?r=2"}), 400
+    if rate <= 0 or rate > 10:
+        return jsonify({"error": "rate 超出范围（0 < r <= 10）"}), 400
+    return jsonify(bc_set_rate(rate))
 
 
 @app.route("/", methods=['GET'])
