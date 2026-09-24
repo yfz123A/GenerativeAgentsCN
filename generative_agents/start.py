@@ -1,4 +1,5 @@
 import os
+import sys
 import copy
 import json
 import time
@@ -17,13 +18,20 @@ from modules.life import seed_personas
 # 花名册从种子来（data/seed.json）；性别/婚配/生死等生命参数见种子文件
 personas = seed_personas()
 
+# 生命事件文件名（与 compress.py 保持一致）；它不是存档，恢复时应跳过
+life_events_name = "life_events.json"
+
 
 class SimulateServer:
-    def __init__(self, name, static_root, checkpoints_folder, config, start_step=0, verbose="info", log_file="", parallel=1):
+    def __init__(self, name, static_root, checkpoints_folder, config, start_step=0, verbose="info", log_file="", parallel=1, min_free_gb=5.0):
         self.name = name
         self.static_root = static_root
         self.checkpoints_folder = checkpoints_folder
         self.parallel = parallel
+        # 挂机相关：磁盘看门狗阈值 + 结束原因（watchdog 据此判断要不要重新拉起）
+        self.min_free_gb = float(min_free_gb)
+        self.exit_reason = None
+        self.last_step = start_step
 
         # 历史存档数据（用于断点恢复）
         self.config = config
@@ -89,7 +97,7 @@ class SimulateServer:
         self.bind_health_to_prompt()
         # 已经过去了几个模拟日（恢复时不能重掷已判定的日子）
         self.life_day = int(life.sim_days_elapsed(utils.get_timer().get_date(), self.life_origin))
-        self.life_events_file = f"{checkpoints_folder}/life_events.json"
+        self.life_events_file = os.path.join(checkpoints_folder, life_events_name)
         self.life_events = []
         if os.path.exists(self.life_events_file):
             with open(self.life_events_file, "r", encoding="utf-8") as f:
@@ -261,8 +269,7 @@ class SimulateServer:
         )
 
     def save_life_events(self):
-        with open(self.life_events_file, "w", encoding="utf-8") as f:
-            f.write(json.dumps(self.life_events, indent=2, ensure_ascii=False))
+        atomic_write_json(self.life_events_file, self.life_events)
 
     # ---------- 婚配 ----------
     def marriage_tick(self, timer, day, step):
@@ -615,15 +622,36 @@ class SimulateServer:
                 continue
         return {}
 
-    def simulate(self, step, stride=0):
+    def disk_free_gb(self):
+        """存档盘剩余空间（GB）。"""
+        probe = self.checkpoints_folder
+        while probe and not os.path.exists(probe):
+            probe = os.path.dirname(probe)
+        try:
+            return shutil.disk_usage(probe or ".").free / (1024 ** 3)
+        except OSError:
+            return float("inf")
+
+    def simulate(self, step, stride=0, forever=False):
+        """推进模拟。
+
+        forever=True 时不设步数上限，直到全灭或磁盘看门狗触发才停；
+        每一步结束都会原子写盘，所以随时可以被 kill / 崩溃后从最近存档续跑。
+        """
         timer = utils.get_timer()
-        for i in range(self.start_step, self.start_step + step):
-            title = "Simulate Step[{}/{}, time: {}]".format(i+1, self.start_step + step, timer.get_date())
+        limit = None if forever else self.start_step + step
+        i = self.start_step
+        while limit is None or i < limit:
+            if forever:
+                title = "Simulate Step[{}, time: {}]".format(i + 1, timer.get_date())
+            else:
+                title = "Simulate Step[{}/{}, time: {}]".format(i+1, limit, timer.get_date())
             self.logger.info("\n" + utils.split_line(title, "="))
 
             # 生命循环：跨模拟日时判定发病/痊愈/死亡（全灭则自动结束）
             self.life_tick(timer, step=i + 1)
             if len(self.agent_status) < 1:
+                self.exit_reason = "extinct"
                 self.logger.info("\n" + utils.split_line("小镇已无居民，模拟结束", "="))
                 break
 
@@ -665,13 +693,18 @@ class SimulateServer:
                     "housing_pool": self.housing_pool,
                 }
             )
-            # 保存Agent活动数据
-            with open(f"{self.checkpoints_folder}/simulate-{sim_time.replace(':', '')}.json", "w", encoding="utf-8") as f:
-                f.write(json.dumps(self.config, indent=2, ensure_ascii=False))
+            # 保存Agent活动数据（原子写：崩溃也不会留下半个存档）
+            atomic_write_json(
+                os.path.join(self.checkpoints_folder, "simulate-{}.json".format(sim_time.replace(":", ""))),
+                self.config,
+            )
             # 保存对话数据
-            with open(f"{self.checkpoints_folder}/conversation.json", "w", encoding="utf-8") as f:
-                f.write(json.dumps(self.game.conversation, indent=2, ensure_ascii=False))
+            atomic_write_json(
+                os.path.join(self.checkpoints_folder, "conversation.json"),
+                self.game.conversation,
+            )
 
+            self.last_step = i + 1
             self.logger.info(
                 "本步耗时 {:.1f} 秒（并行度 {}）".format(time.time() - step_start, self.parallel)
             )
@@ -679,8 +712,58 @@ class SimulateServer:
             if stride > 0:
                 timer.forward(stride)
 
+            # 磁盘看门狗：空间不足时优雅停止（当前步的存档已完整落盘）
+            free_gb = self.disk_free_gb()
+            if free_gb < self.min_free_gb:
+                self.exit_reason = "disk"
+                self.logger.info(
+                    "磁盘剩余 {:.1f}GB 低于阈值 {:.1f}GB，停止模拟（已存档至第 {} 步）".format(
+                        free_gb, self.min_free_gb, i + 1
+                    )
+                )
+                break
+
+            i += 1
+
+        if self.exit_reason is None:
+            self.exit_reason = "finished"
+        self.logger.info(
+            "\n"
+            + utils.split_line(
+                "模拟结束（{}）：共推进到第 {} 步".format(self.exit_reason, self.last_step), "="
+            )
+        )
+
     def load_static(self, path):
         return utils.load_dict(os.path.join(self.static_root, path))
+
+
+def missing_agents(config, static_root="frontend/static"):
+    """续跑前自检：存档里的角色是否都还有静态设定。
+
+    角色改名（或静态目录被清理）后，旧存档会指向不存在的 agent.json，
+    不检查的话会以一个难懂的 JSONDecodeError 崩掉；这里提前给出人话。
+
+    返回找不到静态设定的角色名列表。
+    """
+    missing = []
+    for agent_name, agent in (config.get("agents") or {}).items():
+        rel = (agent or {}).get("config_path") or os.path.join(
+            "assets", "village", "agents", agent_name.replace(" ", "_"), "agent.json"
+        )
+        if not os.path.exists(os.path.join(static_root, rel)):
+            missing.append(agent_name)
+    return missing
+
+
+def atomic_write_json(path, data, indent=2):
+    """原子写存档：先写临时文件再 replace，避免崩溃留下半个 JSON。"""
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(json.dumps(data, indent=indent, ensure_ascii=False))
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
 
 
 # 从存档数据中载入配置，用于断点恢复
@@ -689,25 +772,33 @@ def get_config_from_log(checkpoints_folder):
 
     json_files = list()
     for file_name in files:
-        if file_name.endswith(".json") and file_name != "conversation.json":
+        if file_name.endswith(".json") and file_name not in ("conversation.json", life_events_name):
             json_files.append(os.path.join(checkpoints_folder, file_name))
 
     if len(json_files) < 1:
         return None
 
-    with open(json_files[-1], "r", encoding="utf-8") as f:
-        config = json.load(f)
-
+    # 从最新往前找第一个「完整可用」的存档：崩溃可能留下半个文件、字段缺失或
+    # 时间格式异常，挂机自动续跑时应当回退到上一条可用存档，而不是原地再崩一次。
     assets_root = os.path.join("assets", "village")
-
-    start_time = datetime.datetime.strptime(config["time"], "%Y%m%d-%H:%M")
-    start_time += datetime.timedelta(minutes=config["stride"])
-    config["time"] = {"start": start_time.strftime("%Y%m%d-%H:%M")}
-    agents = config["agents"]
-    for a in agents:
-        config["agents"][a]["config_path"] = os.path.join(assets_root, "agents", a.replace(" ", "_"), "agent.json")
-
-    return config
+    for path in reversed(json_files):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                config = json.load(f)
+        except (json.JSONDecodeError, UnicodeDecodeError, OSError):
+            continue
+        if not isinstance(config, dict) or "agents" not in config or "time" not in config:
+            continue
+        try:
+            start_time = datetime.datetime.strptime(config["time"], "%Y%m%d-%H:%M")
+        except (ValueError, TypeError):
+            continue
+        start_time += datetime.timedelta(minutes=config.get("stride", 10))
+        config["time"] = {"start": start_time.strftime("%Y%m%d-%H:%M")}
+        for a in config["agents"]:
+            config["agents"][a]["config_path"] = os.path.join(assets_root, "agents", a.replace(" ", "_"), "agent.json")
+        return config
+    return None
 
 
 # 为新游戏创建配置
@@ -749,6 +840,17 @@ parser.add_argument(
     default=1,
     help="阶段化并行的线程数（1=完全串行，建议 4~8；需 Ollama 侧 OLLAMA_NUM_PARALLEL 同步调大）",
 )
+parser.add_argument(
+    "--forever",
+    action="store_true",
+    help="无限推进（挂机）：不设步数上限，直到全灭或磁盘不足；配合 run_forever.py 可崩溃自动续跑",
+)
+parser.add_argument(
+    "--min-free-gb",
+    type=float,
+    default=5.0,
+    help="磁盘看门狗阈值（GB）：存档盘剩余低于该值时优雅停止，默认 5",
+)
 args = parser.parse_args()
 
 
@@ -759,26 +861,45 @@ if __name__ == "__main__":
     if len(name) < 1:
         name = input("Please enter a simulation name (e.g. sim-test): ")
 
-    resume = args.resume
-    if resume:
-        while not os.path.exists(f"{checkpoints_path}/{name}"):
-            name = input(f"'{name}' doesn't exists, please re-enter the simulation name: ")
-    else:
-        while os.path.exists(f"{checkpoints_path}/{name}"):
-            name = input(f"The name '{name}' already exists, please enter a new name: ")
-
     checkpoints_folder = f"{checkpoints_path}/{name}"
-
     start_time = args.start
-    if resume:
-        sim_config = get_config_from_log(checkpoints_folder)
+
+    # 续跑判定：有可用存档就接着跑；没有（目录不存在、或里面只有半个文件的存档 ——
+    # 挂机时第一步就崩溃正是这个状态）则降级为新局，避免监督器把「无处可续」当成正常结束。
+    sim_config = None
+    if args.resume:
+        if os.path.isdir(checkpoints_folder):
+            sim_config = get_config_from_log(checkpoints_folder)
         if sim_config is None:
-            print("No checkpoint file found to resume running.")
-            exit(0)
-        start_step = sim_config["step"]
-    else:
+            if args.forever:
+                print("没有可用存档，按新局开始（--forever）。")
+            else:
+                while not os.path.exists(checkpoints_folder):
+                    name = input(f"'{name}' doesn't exists, please re-enter the simulation name: ")
+                    checkpoints_folder = f"{checkpoints_path}/{name}"
+                sim_config = get_config_from_log(checkpoints_folder)
+                if sim_config is None:
+                    print("No checkpoint file found to resume running.")
+                    exit(0)
+
+    if sim_config is None:
+        # 新局：交互式运行时保留重名保护；挂机（--forever）下直接复用目录，不阻塞
+        if not args.forever:
+            while os.path.exists(checkpoints_folder):
+                name = input(f"The name '{name}' already exists, please enter a new name: ")
+                checkpoints_folder = f"{checkpoints_path}/{name}"
+        os.makedirs(checkpoints_folder, exist_ok=True)
         sim_config = get_config(start_time, args.stride, personas)
         start_step = 0
+    else:
+        start_step = sim_config["step"]
+        missing = missing_agents(sim_config, static_root="frontend/static")
+        if missing:
+            print("无法续跑：存档里的这些角色在当前静态设定里找不到 ——")
+            print("  {}".format("、".join(missing[:10]) + ("…" if len(missing) > 10 else "")))
+            print("常见原因：角色改名后，旧存档与新的 agent.json 不再对应。")
+            print("处理办法：换个新名字开新局；这份存档仍可用 compress.py 回放。")
+            sys.exit(2)
 
     static_root = "frontend/static"
 
@@ -791,5 +912,11 @@ if __name__ == "__main__":
         args.verbose,
         args.log,
         parallel=max(1, args.parallel),
+        min_free_gb=args.min_free_gb,
     )
-    server.simulate(args.step, args.stride)
+    server.simulate(args.step, args.stride, forever=args.forever)
+
+    # 结束标记：给挂机监督器（run_forever.py）与人看的收尾行
+    print("SIMULATION_END reason={} last_step={} name={}".format(
+        server.exit_reason, server.last_step, name
+    ))
