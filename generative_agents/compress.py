@@ -58,6 +58,9 @@ class MovementBuilder:
         self._maze = None
         # 花名册：每个角色出现在哪些步（用于回放时决定何时生成/何时变成墓碑）
         self.agent_steps = {}
+        # 运行时权威值（最后一步存档里的 life.spouse / homes）：
+        # 种子夫妻没有婚礼事件，婚姻与住所要以运行时状态为准
+        self._runtime = {}
 
     def _get_maze(self):
         if self._maze is None:
@@ -204,6 +207,15 @@ class MovementBuilder:
                 detail["health"] = life_state["health"]
             self.all_movement["description"][agent_name] = detail
 
+            # 记录运行时权威的配偶与住所（最后一步的值）：种子夫妻没有婚礼事件，
+            # 搬家/再婚也只体现在存档里
+            rt = self._runtime.setdefault(agent_name, {})
+            if life_state.get("spouse"):
+                rt["spouse"] = life_state["spouse"]
+            homes = json_data.get("homes") or {}
+            if agent_name in homes and homes[agent_name]:
+                rt["home"] = list(homes[agent_name])
+
         # 花名册：记录每个角色首次/最后一次出现的步（生死决定何时出现、何时变墓碑）
         for agent_name in agents.keys():
             record = self.agent_steps.setdefault(agent_name, [step, step])
@@ -237,6 +249,9 @@ class MovementBuilder:
             if info:
                 entry["gender"] = info.get("gender", "")
                 entry["base_age"] = float(info.get("age", 0))
+                entry.setdefault("spouse", info.get("spouse") or "")   # 种子婚配（开局即夫妻）
+                if info.get("home"):
+                    entry.setdefault("home", list(info["home"]))       # 种子住所
             roster[agent_name] = entry
 
         for event in events:
@@ -284,6 +299,13 @@ class MovementBuilder:
                     who_entry["married_frame"] = (event.get("step", 1) - 1) * frames_per_step + 1
                     if event.get("home"):
                         who_entry["home"] = event["home"]
+        # 运行时最终状态覆盖（搬家/再婚以最后一步存档为准）
+        for name, rt in self._runtime.items():
+            entry = roster.setdefault(name, {})
+            if rt.get("spouse"):
+                entry["spouse"] = rt["spouse"]
+            if rt.get("home"):
+                entry["home"] = rt["home"]
         return roster
 
     def first_seen_coord(self, agent_name):
