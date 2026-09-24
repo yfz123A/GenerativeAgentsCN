@@ -5,6 +5,11 @@ import re
 import requests
 from magentic import prompt
 
+# 单次请求的上下文上限。必须显式指定：不指定时 Ollama 会按显存自动选（本机是 32k），
+# 而它与 OLLAMA_NUM_PARALLEL 相乘决定 KV cache 占用——32k × 8 路会撑爆显存并掉到 CPU，
+# 实测生成速度从 ~60 tok/s 掉到 2.4 tok/s。
+default_num_ctx = 8192
+
 
 class LLMModel:
     def __init__(self, config):
@@ -101,6 +106,10 @@ class OllamaLLMModel(LLMModel):
             "messages": messages,
             "temperature": temperature,
             "stream": False,
+            # 关掉思考型模型（qwen3 等）的推理过程：不关的话单次请求会先生成上千 token 的
+            # 思考内容，实测同一任务 9.7s/259tok → 0.6s/24tok。对非思考模型该字段无副作用。
+            "reasoning_effort": "none",
+            "options": {"num_ctx": default_num_ctx},
         }
         if response_format:
             params["response_format"] = response_format

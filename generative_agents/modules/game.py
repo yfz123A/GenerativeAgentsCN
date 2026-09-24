@@ -2,6 +2,8 @@
 
 import os
 import copy
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from modules.utils import GenerativeAgentsMap, GenerativeAgentsKey
 from modules import utils
@@ -39,9 +41,9 @@ class Game:
     def get_agent(self, name):
         return self.agents[name]
 
-    def agent_think(self, name, status):
+    def agent_info(self, name):
+        """收集一个 Agent 本步的概要信息并写日志（与串行版完全一致）"""
         agent = self.get_agent(name)
-        plan = agent.think(status, self.agents)
         info = {
             "currently": agent.scratch.currently,
             "associate": agent.associate.abstract(),
@@ -67,7 +69,78 @@ class Game:
             name, utils.get_timer().get_date("%Y%m%d-%H:%M:%S")
         )
         self.logger.info("\n{}\n{}\n".format(utils.split_line(title), agent))
-        return {"plan": plan, "info": info}
+        return info
+
+    def agent_think(self, name, status):
+        agent = self.get_agent(name)
+        plan = agent.think(status, self.agents)
+        return {"plan": plan, "info": self.agent_info(name)}
+
+    def agent_think_phases(self, statuses, parallel=1):
+        """按阶段推进本步的所有 Agent（阶段化并行）。
+
+        只把「纯角色私有状态 + LLM」的阶段放进线程池（日程重算 / 感知 / 反思），
+        会写共享世界状态的阶段（移动、路径）与跨角色交互阶段（对话、等待）保持串行，
+        所以并行的只是推理本身。
+
+        与串行版的语义差别：所有 Agent 先各自移动、再各自感知/决策，即
+        「同时行动」语义——互相看到的不是同一轮里已经做好的决策，而是上一轮的结果。
+        parallel=1 时退化为完全串行（与 agent_think 逐条等价）。
+        """
+        names = list(statuses.keys())
+        agents = self.agents
+        results = {}
+
+        def run_phase(fn):
+            if parallel <= 1 or len(names) <= 1:
+                for n in names:
+                    fn(n)
+                return
+            with ThreadPoolExecutor(max_workers=min(parallel, len(names))) as pool:
+                futures = {pool.submit(fn, n): n for n in names}
+                for fut in as_completed(futures):
+                    exc = fut.exception()
+                    if exc is not None:
+                        raise RuntimeError(
+                            "并行阶段失败（agent={}）".format(futures[fut])
+                        ) from exc
+
+        phase_cost = {}
+        t0 = time.time()
+
+        def mark(label):
+            nonlocal t0
+            now = time.time()
+            phase_cost[label] = round(now - t0, 1)
+            t0 = now
+
+        for n in names:                                     # S0 移动（写迷宫，串行）
+            agents[n].stage_move(statuses[n])
+        mark("S0移动")
+        run_phase(lambda n: agents[n].stage_schedule())      # S1 日程（LLM，并行）
+        mark("S1日程")
+        for n in names:                                     # S2 归位/醒睡（串行）
+            agents[n].stage_settle()
+        mark("S2归位")
+        run_phase(lambda n: agents[n].stage_percept())       # S3 感知打分（LLM，并行）
+        mark("S3感知")
+        for n in names:                                     # S4 互动（对话/等待，跨角色，串行）
+            agents[n].stage_plan(agents)
+        mark("S4互动")
+        run_phase(lambda n: agents[n].stage_decide_reflect())  # S5 行动决策+反思（LLM，并行）
+        mark("S5决策/反思")
+        for n in names:                                     # S6 路径与回放计划（串行）
+            plan = agents[n].stage_finish(agents)
+            results[n] = {"plan": plan, "info": self.agent_info(n)}
+        mark("S6路径")
+
+        self.logger.info(
+            "阶段耗时（秒，并行度 {}）: {}".format(
+                parallel,
+                "  ".join("{}={}".format(k, v) for k, v in phase_cost.items()),
+            )
+        )
+        return results
 
     def load_static(self, path):
         return utils.load_dict(os.path.join(self.static_root, path))

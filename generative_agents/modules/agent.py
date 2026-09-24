@@ -39,6 +39,12 @@ class Agent:
         self.status = utils.update_dict(status, config.get("status", {}))
         self.plan = config.get("plan", {})
 
+        # 分阶段推进用的中间状态（见 stage_* 系列方法）
+        self._stage_events = {}
+        self._stage_plan = None
+        self._stage_awake = True
+        self._stage_reacted = False
+
         # record
         self.last_record = utils.get_timer().daily_duration()
 
@@ -105,15 +111,40 @@ class Agent:
         return output
 
     def think(self, status, agents):
-        events = self.move(status["coord"], status.get("path"))
-        plan, _ = self.make_schedule()
+        """串行版：按阶段顺序执行同一个 Agent 的一步（保留原行为，便于对照与回退）"""
+        self.stage_move(status)
+        self.stage_schedule()
+        self.stage_settle()
+        self.stage_percept()
+        self.stage_plan(agents)
+        self.stage_decide_reflect()
+        return self.stage_finish(agents)
 
+    # ---------- 分阶段推进 ----------
+    # 每个阶段只做原来 think() 里的一小段，便于「跨 Agent 并行」：
+    #   stage_move / stage_settle / stage_finish 会写共享世界状态（迷宫、路径），必须串行；
+    #   stage_plan 要读别的 Agent 的状态且含两人交替的对话，必须串行；
+    #   stage_schedule / stage_percept / stage_decide_reflect 只碰角色私有状态 + 调 LLM，可并行。
+
+    def stage_move(self, status):
+        """S0：结算本步移动（写迷宫事件，串行）"""
+        self._stage_events = self.move(status["coord"], status.get("path"))
+        return self._stage_events
+
+    def stage_schedule(self):
+        """S1：日程重算（角色私有 + LLM，可并行）"""
+        self._stage_plan, _ = self.make_schedule()
+        return self._stage_plan
+
+    def stage_settle(self):
+        """S2：睡觉归位 / 醒睡判定（可能移动，串行）"""
+        plan = self._stage_plan
         if (plan["describe"] == "sleeping" or "睡" in plan["describe"]) and self.is_awake():
             self.logger.info("{} is going to sleep...".format(self.name))
             address = self.spatial.find_address("睡觉", as_list=True)
             tiles = self.maze.get_address_tiles(address)
             coord = random.choice(list(tiles))
-            events = self.move(coord)
+            self._stage_events = self.move(coord)
             self.action = memory.Action(
                 memory.Event(self.name, "正在", "睡觉", address=address, emoji="😴"),
                 memory.Event(
@@ -126,18 +157,41 @@ class Agent:
                 duration=plan["duration"],
                 start=utils.get_timer().daily_time(plan["start"]),
             )
-        if self.is_awake():
-            self.percept()
-            self.make_plan(agents)
-            self.reflect()
-        else:
-            if self.action.finished():
-                self.action = self._determine_action()
+        self._stage_awake = self.is_awake()
+        if not self._stage_awake and self.action.finished():
+            self.action = self._determine_action()
+        return self._stage_awake
 
+    def stage_percept(self):
+        """S3：感知与打分（读迷宫 + 写自己的记忆 + LLM，可并行）"""
+        if self._stage_awake:
+            self.percept()
+
+    def stage_plan(self, agents):
+        """S4a：与他人互动（对话/等待，跨角色，必须串行）
+
+        等价于 make_plan() 的前半段：如果这一步发生了互动，
+        后半段的行动决策就跳过（与原逻辑一致）。
+        """
+        self._stage_reacted = False
+        if self._stage_awake:
+            self._stage_reacted = self._reaction(agents)
+        return self._stage_reacted
+
+    def stage_decide_reflect(self):
+        """S4b+S5：行动决策 + 反思（角色私有 + LLM，可并行）"""
+        if not self._stage_awake:
+            return
+        if (not self._stage_reacted) and (not self.path) and self.action.finished():
+            self.action = self._determine_action()
+        self.reflect()
+
+    def stage_finish(self, agents):
+        """S6：算路径、组装回放计划（读其他角色，串行）"""
         emojis = {}
         if self.action:
             emojis[self.name] = {"emoji": self.get_event().emoji, "coord": self.coord}
-        for eve, coord in events.items():
+        for eve, coord in self._stage_events.items():
             if eve.subject in agents:
                 continue
             emojis[":".join(eve.address)] = {"emoji": eve.emoji, "coord": coord}

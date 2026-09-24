@@ -1,6 +1,7 @@
 import os
 import copy
 import json
+import time
 import argparse
 import datetime
 
@@ -22,10 +23,11 @@ personas = [
 
 
 class SimulateServer:
-    def __init__(self, name, static_root, checkpoints_folder, config, start_step=0, verbose="info", log_file=""):
+    def __init__(self, name, static_root, checkpoints_folder, config, start_step=0, verbose="info", log_file="", parallel=1):
         self.name = name
         self.static_root = static_root
         self.checkpoints_folder = checkpoints_folder
+        self.parallel = parallel
 
         # 历史存档数据（用于断点恢复）
         self.config = config
@@ -73,8 +75,18 @@ class SimulateServer:
         for i in range(self.start_step, self.start_step + step):
             title = "Simulate Step[{}/{}, time: {}]".format(i+1, self.start_step + step, timer.get_date())
             self.logger.info("\n" + utils.split_line(title, "="))
+            step_start = time.time()
+            if self.parallel > 1:
+                # 阶段化并行：LLM 密集且只碰角色私有状态的阶段走线程池
+                self.logger.info("本步并行度: {}".format(self.parallel))
+                results = self.game.agent_think_phases(self.agent_status, self.parallel)
+            else:
+                results = {
+                    name: self.game.agent_think(name, status)
+                    for name, status in self.agent_status.items()
+                }
             for name, status in self.agent_status.items():
-                plan = self.game.agent_think(name, status)["plan"]
+                plan = results[name]["plan"]
                 agent = self.game.get_agent(name)
                 if name not in self.config["agents"]:
                     self.config["agents"][name] = {}
@@ -99,6 +111,10 @@ class SimulateServer:
             # 保存对话数据
             with open(f"{self.checkpoints_folder}/conversation.json", "w", encoding="utf-8") as f:
                 f.write(json.dumps(self.game.conversation, indent=2, ensure_ascii=False))
+
+            self.logger.info(
+                "本步耗时 {:.1f} 秒（并行度 {}）".format(time.time() - step_start, self.parallel)
+            )
 
             if stride > 0:
                 timer.forward(stride)
@@ -167,6 +183,12 @@ parser.add_argument("--step", type=int, default=10, help="The simulate step")
 parser.add_argument("--stride", type=int, default=10, help="The step stride in minute")
 parser.add_argument("--verbose", type=str, default="debug", help="The verbose level")
 parser.add_argument("--log", type=str, default="", help="Name of the log file")
+parser.add_argument(
+    "--parallel",
+    type=int,
+    default=1,
+    help="阶段化并行的线程数（1=完全串行，建议 4~8；需 Ollama 侧 OLLAMA_NUM_PARALLEL 同步调大）",
+)
 args = parser.parse_args()
 
 
@@ -200,5 +222,14 @@ if __name__ == "__main__":
 
     static_root = "frontend/static"
 
-    server = SimulateServer(name, static_root, checkpoints_folder, sim_config, start_step, args.verbose, args.log)
+    server = SimulateServer(
+        name,
+        static_root,
+        checkpoints_folder,
+        sim_config,
+        start_step,
+        args.verbose,
+        args.log,
+        parallel=max(1, args.parallel),
+    )
     server.simulate(args.step, args.stride)
