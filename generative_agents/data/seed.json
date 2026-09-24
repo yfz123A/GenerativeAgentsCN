@@ -17,7 +17,9 @@
     "profile": "standard",
     "dice_seed": 20260924
   },
-  "housing_pool": [],
+  "housing_pool": [
+    ["the Ville", "周氏家族的房子", "空卧室"]
+  ],
   "agents": [
     { "name": "唐诗雅", "gender": "女", "age": 20, "spouse": null, "children": [], "home": ["the Ville", "奥克山学院宿舍", "唐诗雅的房间"] },
     { "name": "冯远帆", "gender": "男", "age": 20, "spouse": null, "children": [], "home": ["the Ville", "奥克山学院宿舍", "冯远帆的房间"] },

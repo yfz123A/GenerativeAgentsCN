@@ -248,6 +248,16 @@ class MovementBuilder:
                 entry["first_frame"] = (step - 1) * frames_per_step + 1
                 entry.pop("infant", None)
                 entry.setdefault("last_frame", self.step * frames_per_step)
+            elif event.get("type") == "marriage":
+                # 婚配：双方互相登记配偶与新家（不改变存在区间，仅供展示）
+                for who, other in ((name, event.get("spouse")), (event.get("spouse"), name)):
+                    if not who or not other:
+                        continue
+                    who_entry = roster.setdefault(who, {})
+                    who_entry["spouse"] = other
+                    who_entry["married_frame"] = (event.get("step", 1) - 1) * frames_per_step + 1
+                    if event.get("home"):
+                        who_entry["home"] = event["home"]
         return roster
 
     def first_seen_coord(self, agent_name):

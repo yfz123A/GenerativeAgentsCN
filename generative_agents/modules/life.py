@@ -250,6 +250,58 @@ def child_age(child, day_index):
     return (day_index - child["birth_day"]) * years_per_sim_day()
 
 
+# ============ 婚配判定（骰子层） ============
+#
+# 设计（评审 Q4c「分层」）：骰子负责「筛候选 + 决定成婚」，LLM 只写一场婚礼叙事
+# （一次性、有预算）。与生死判定同样是确定性的：同一存档重放，婚配线一致。
+MARRIAGE_CHANCE = 0.35   # 每天在适龄单身者中促成一对婚礼的概率
+
+
+def marriage_roll(day_index, dice_seed):
+    """确定性骰子：今天是否举办婚礼。"""
+    return _rng(dice_seed, "marriage", day_index).random() < MARRIAGE_CHANCE
+
+
+def pick_pair(pairs, day_index, dice_seed):
+    """从合法配对中确定性地选一对。"""
+    rng = _rng(dice_seed, "couple", day_index)
+    return pairs[rng.randrange(len(pairs))]
+
+
+def is_close_kin(parents_a, parents_b, name_a, name_b):
+    """禁止近亲：直系（父母/子女）与兄弟姐妹（共享任一亲本）。"""
+    if name_a in parents_b or name_b in parents_a:
+        return True
+    return bool(set(parents_a) & set(parents_b))
+
+
+def wedding_prompt(groom, bride, groom_scratch, bride_scratch):
+    """婚礼叙事：一次 LLM 调用，产出小镇公告式的短叙事。"""
+    return (
+        "小镇上，{groom} 与 {bride} 决定结为夫妻。\n"
+        "{groom}：{g_in}；{g_learned}\n"
+        "{bride}：{b_in}；{b_learned}\n"
+        "请以小镇见闻的口吻写一段简短的婚礼叙事（2~3 句）：可以写婚礼的场面、"
+        "到场亲友的祝福，或两人当时的心情。\n"
+        "只输出叙事本身，不要标题、不要引号、不要换行。"
+    ).format(
+        groom=groom, bride=bride,
+        g_in=groom_scratch.get("innate", ""), g_learned=groom_scratch.get("learned", ""),
+        b_in=bride_scratch.get("innate", ""), b_learned=bride_scratch.get("learned", ""),
+    )
+
+
+def parse_wedding(text, limit=220):
+    """把 LLM 输出收敛成一句干净的叙事；空输出返回空串（由调用方兜底）。"""
+    if not text:
+        return ""
+    text = " ".join(text.split())
+    text = text.strip().strip("\"'“”「」")
+    if len(text) > limit:
+        text = text[:limit].rstrip() + "…"
+    return text
+
+
 def child_name_prompt(father, mother, gender, existing_names=None):
     """让 LLM 起名：姓氏随父，符合中国习惯。"""
     used = "、".join(existing_names or [])

@@ -105,7 +105,30 @@ class SimulateServer:
             self.agent_gender[agent_name] = self.read_gender(agent_name)
         for child in self.children:
             self.agent_gender[child["name"]] = child.get("gender", "")
+
+        # ---------- 婚配与住房 ----------
+        # 运行时住址表：搬家只改它（agent.json 保持初始设定不被改写），随存档持久化
+        self.housing_pool = [list(x) for x in config.get(
+            "housing_pool", life.load_seed().get("housing_pool", [])
+        )]
+        self.homes = {}
+        saved_homes = config.get("homes") or {}
+        for agent_name in self.agent_status.keys():
+            self.homes[agent_name] = list(
+                saved_homes.get(agent_name) or self.read_home(agent_name)
+            )
+        for agent_name, home in saved_homes.items():   # 断点续跑：把已搬迁的家应用回角色
+            if home:
+                self.apply_home(agent_name, home)
         self._life_llm = None
+
+    def apply_home(self, agent_name, home):
+        """把住址写进运行中的角色（spatial.address + 派生的睡觉地址）。"""
+        agent = self.game.agents.get(agent_name)
+        if not agent:
+            return
+        agent.spatial.address["living_area"] = list(home)
+        agent.spatial.address["睡觉"] = list(home) + ["床"]
 
     def read_gender(self, agent_name):
         path = f"frontend/static/assets/village/agents/{agent_name}/agent.json"
@@ -114,6 +137,24 @@ class SimulateServer:
                 return json.load(f).get("gender", "")
         except (FileNotFoundError, json.JSONDecodeError):
             return ""
+
+    def read_home(self, agent_name):
+        """角色的初始住址（静态设定里的 living_area）。"""
+        path = f"frontend/static/assets/village/agents/{agent_name}/agent.json"
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)["spatial"]["address"]["living_area"]
+        except (FileNotFoundError, json.JSONDecodeError, KeyError):
+            return []
+
+    def read_scratch(self, agent_name):
+        """角色的静态设定（先天/后天等），用于婚礼与人设生成。"""
+        path = f"frontend/static/assets/village/agents/{agent_name}/agent.json"
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f).get("scratch", {})
+        except (FileNotFoundError, json.JSONDecodeError):
+            return {}
 
     def life_llm(self):
         """起名 / 撰写人设专用的小 LLM 句柄（与角色同源配置）。"""
@@ -187,6 +228,8 @@ class SimulateServer:
                             self.strip_health(agent.scratch.currently)
                             + self.health_note(state)
                         )
+        # 婚配链路：配对 → 婚礼叙事 → 搬家（婚后即打开生育窗口）
+        events.extend(self.marriage_tick(timer, day, step))
         # 生育链路：受孕 → 分娩 → 入学（同一天内推进）
         events.extend(self.family_tick(timer, day, step))
 
@@ -220,6 +263,101 @@ class SimulateServer:
     def save_life_events(self):
         with open(self.life_events_file, "w", encoding="utf-8") as f:
             f.write(json.dumps(self.life_events, indent=2, ensure_ascii=False))
+
+    # ---------- 婚配 ----------
+    def marriage_tick(self, timer, day, step):
+        """一天推进一次：适龄单身者配对 → LLM 婚礼叙事 → 搬家（婚后受孕窗口自动打开）。"""
+        now = timer.get_date()
+        if not life.marriage_roll(day, self.dice_seed):
+            return []
+
+        # 1) 适龄单身者：无在世配偶、已达婚龄；按姓名排序保证骰子可复现
+        singles = {"男": [], "女": []}
+        for name in sorted(self.agent_status.keys()):
+            state = self.life_state.get(name)
+            if state is None or state["health"] == life.DEAD:
+                continue
+            spouse = state.get("spouse") or ""
+            if spouse and spouse in self.agent_status:
+                continue                     # 有在世配偶
+            age = life.abstract_age(self.agent_base_age.get(name, 30.0), now, self.life_origin)
+            if age < self.population["marry_min_age"]:
+                continue
+            gender = self.agent_gender.get(name)
+            if gender in singles:
+                singles[gender].append(name)
+        if not singles["男"] or not singles["女"]:
+            return []
+
+        # 2) 合法配对（排除近亲），骰子选一对
+        pairs = []
+        for groom in singles["男"]:
+            gp = self.life_state[groom].get("parents") or []
+            for bride in singles["女"]:
+                bp = self.life_state[bride].get("parents") or []
+                if life.is_close_kin(gp, bp, groom, bride):
+                    continue
+                pairs.append((groom, bride))
+        if not pairs:
+            return []
+        groom, bride = life.pick_pair(pairs, day, self.dice_seed)
+
+        # 3) 婚礼叙事（一次 LLM 调用，失败则用兜底文案）
+        narrative = self.generate_wedding(groom, bride)
+
+        # 4) 结为夫妻 —— family_tick 的受孕判定会随「有在世配偶」自动生效
+        self.life_state[groom]["spouse"] = bride
+        self.life_state[bride]["spouse"] = groom
+
+        # 5) 搬家：优先住房池，池空则搬入男方住处
+        home = self.assign_home(groom, bride)
+
+        # 6) 婚礼见闻写进对话记录 —— 直播台的「对话记录」栏会显示它
+        key = now.strftime("%Y%m%d-%H:%M")
+        self.game.conversation.setdefault(key, []).append({
+            "{} 与 {} @ 小镇教堂".format(groom, bride): [["小镇公告", narrative]]
+        })
+
+        event = {
+            "type": "marriage", "name": groom, "spouse": bride,
+            "day": day, "step": step, "age": None,
+            "home": home, "narrative": narrative,
+            "time": now.strftime("%Y%m%d-%H:%M"),
+        }
+        self.logger.info(
+            "{} 与 {} 结为夫妻（新家：{}）—— {}".format(
+                groom, bride, "，".join(home or []), narrative
+            )
+        )
+        return [event]
+
+    def generate_wedding(self, groom, bride):
+        """LLM 婚礼叙事；失败或空输出时退回一句朴素文案。"""
+        try:
+            prompt_text = life.wedding_prompt(
+                groom, bride, self.read_scratch(groom), self.read_scratch(bride)
+            )
+            text = self.life_llm().completion(prompt_text, retry=3, caller="life_wedding")
+            narrative = life.parse_wedding(text)
+            if narrative:
+                return narrative
+        except Exception as e:
+            self.logger.info("婚礼叙事生成失败，改用兜底文案：{}".format(e))
+        return "{}与{}在小镇教堂举行了简单的婚礼，亲友们都来道贺。".format(groom, bride)
+
+    def assign_home(self, groom, bride):
+        """新婚住房：优先分配住房池的空房，池空则搬入男方（或女方）现有住所。"""
+        home = None
+        if self.housing_pool:
+            home = list(self.housing_pool.pop(0))
+        if not home:
+            home = list(self.homes.get(groom) or self.homes.get(bride) or [])
+        if not home:
+            return None
+        for who in (groom, bride):
+            self.homes[who] = list(home)
+            self.apply_home(who, home)
+        return home
 
     # ---------- 生育与成长 ----------
     def family_tick(self, timer, day, step):
@@ -353,14 +491,12 @@ class SimulateServer:
             i += 1
 
     def child_home(self, mother_name, father_name):
-        """孩子住在母亲（或父亲）的住所。"""
+        """孩子住在母亲（或父亲）当前的住所（搬家后以运行时住址表为准）。"""
+        homes = getattr(self, "homes", None) or {}
         for who in (mother_name, father_name):
-            path = f"frontend/static/assets/village/agents/{who}/agent.json"
-            try:
-                with open(path, "r", encoding="utf-8") as f:
-                    return json.load(f)["spatial"]["address"]["living_area"]
-            except (FileNotFoundError, json.JSONDecodeError, KeyError):
-                continue
+            home = homes.get(who) or self.read_home(who)   # 兜底：退回静态设定
+            if home:
+                return list(home)
         return ["the Ville"]
 
     def write_child_assets(self, child):
@@ -524,6 +660,9 @@ class SimulateServer:
                     "step": i + 1,
                     # 幼儿登记表随存档持久化（0~6 岁不进模拟循环，只作被照顾对象）
                     "children": self.children,
+                    # 婚配与住房：住址表与住房池（搬过家的人续跑后仍在各自的新家）
+                    "homes": self.homes,
+                    "housing_pool": self.housing_pool,
                 }
             )
             # 保存Agent活动数据
