@@ -35,6 +35,7 @@
 	let bc_rate = 1.0;
 	let bc_paused = false;
 	let bc_rate_buttons = {};                     // 1x/2x/3x 按钮（create() 里创建）
+	let bc_seek = null;                           // 全场跳转函数（create() 里赋值，仅直播台）
 
 	// 全场虚拟时刻：暂停时冻结；否则按倍率从上次轮询点外推（确定性，无累积误差）
 	function server_now_ms() {
@@ -59,6 +60,78 @@
 		bc_paused = !!d.paused;
 		bc_rate = d.rate > 0 ? d.rate : 1;
 		refresh_bc_buttons();
+	}
+
+	// ---------- 侧边栏信息卡 ----------
+	// 年龄是「画面时刻」的函数：随播放实时增长，循环回绕后回到初始（与画面一致）。
+	let years_per_sim_day = {{ years_per_sim_day|default(4)|tojson }};
+	let frames_per_day = (1440 / min_per_step) * frames_per_step;   // 一天多少帧
+	let card_open = "";                                              // 当前展开的信息卡（下划线名）
+
+	// 角色 frame 帧时的年龄（岁，浮点）；未出生返回 null
+	function bc_age_of(name, frame) {
+		let r = roster[name] || {};
+		let born = (r.born_frame !== undefined) ? r.born_frame : 0;
+		if (frame < born) return null;
+		let base = (r.base_age !== undefined) ? r.base_age : 0;
+		return base + ((frame - born) / frames_per_day) * years_per_sim_day;
+	}
+
+	let bc_health_text = { "healthy": "健康", "mild": "不适（小病）", "severe": "卧床（重病）" };
+
+	// 填充一张信息卡的静态部分（性别/健康/配偶/住所/近期状况/年龄）。
+	// 健康、近期状况是「最新值」（compress 从最后一步存档提取），不随播放帧变化；
+	// 年龄由 update_broadcast() 每帧刷新。由 index.html 的头像点击回调调用。
+	window.fill_agent_card = function (name) {
+		card_open = name;
+		let r = roster[name] || {};
+		let detail = (all_movement["description"] || {})[name] || {};
+		let state = roster_state(name, bc_last_frame >= 0 ? bc_last_frame : 1);
+		let set = function (suffix, text) {
+			let el = document.getElementById(suffix + name);
+			if (el) el.innerHTML = text;
+		};
+
+		// 身体状况：已故优先显示享年与死因；其余按最新健康档位
+		if (state === "dead") {
+			let age = r.age_at_death;
+			set("agent_health__", "已故（享年 " + (age !== undefined && age !== null ? Math.floor(age) + " 岁" : "—") +
+				(r.died_of ? "，" + r.died_of : "") + "）");
+		} else {
+			set("agent_health__", bc_health_text[detail.health] || "—");
+		}
+
+		// 年龄 / 性别
+		let age = bc_age_of(name, bc_last_frame >= 0 ? bc_last_frame : 1);
+		set("agent_age__", age === null ? "未出生" : Math.floor(age) + " 岁");
+		set("agent_gender__", r.gender || "—");
+
+		// 婚姻（婴幼儿显示父母；已故保留生前配偶）
+		if (r.parents && r.parents.length > 1) {
+			set("agent_spouse__", "—（" + r.parents[0] + " 与 " + r.parents[1] + " 的孩子）");
+		} else {
+			set("agent_spouse__", r.spouse || "—");
+		}
+
+		// 住所
+		set("agent_home__", (r.home && r.home.length) ? r.home.slice(1).join("，") : "—");
+
+		// 近期状况（最新值）
+		set("agent_desc__", detail.currently || "—");
+	};
+
+	// 每帧刷新打开卡片的年龄（DOM 只写一个 span，代价可忽略）
+	function bc_refresh_card_age(frame) {
+		if (!card_open) return;
+		let el = document.getElementById("agent_age__" + card_open);
+		if (!el) return;
+		let age = bc_age_of(card_open, frame);
+		el.innerHTML = (age === null || state_is_unborn(card_open, frame)) ? "未出生" : Math.floor(age) + " 岁";
+	}
+
+	function state_is_unborn(name, frame) {
+		let r = roster[name];
+		return !!(r && r.born_frame !== undefined && frame < r.born_frame);
 	}
 
 	// 控制指令：发给服务端，服务端返回新状态后立即应用（乐观更新 + 2 秒轮询兜底）
@@ -456,13 +529,41 @@
 			posX += btn.width + 6;
 		});
 		refresh_bc_buttons();
+
+		// 全场跳转：◀ ▶ 步进 ±1 步；点「第 x/N 步」输入任意步。
+		// 与暂停/倍率同为全场操作：任何人跳，所有人的画面 2 秒内一起跳，
+		// 并保持当前倍率与暂停状态（跳转是拖动进度条，不是换节目）。
+		bc_seek = function (n) {
+			n = Math.round(Number(n));
+			if (isNaN(n) || n < 1) n = 1;
+			if (n > total_steps) n = total_steps;
+			bc_cmd("/bc/seek?step=" + n);
+		};
+		let btn_prev = add_text(this, posX, posY, " ◀ ", "#ffffcc");
+		btn_prev.setInteractive();
+		btn_prev.on("pointerdown", () => { bc_seek(bc_last_step - 1); });
+		posX += btn_prev.width + 2;
+		let btn_next = add_text(this, posX, posY, " ▶ ", "#ffffcc");
+		btn_next.setInteractive();
+		btn_next.on("pointerdown", () => { bc_seek(bc_last_step + 1); });
+		posX += btn_next.width + 10;
 {% endif %}
 
 		// Show current time
 		currentTime = add_text(this, posX, posY, "", "#ccffcc");
 
-		// 实时模式的运行状态提示
+		// 实时模式的运行状态提示（直播台下它是可点击的「第 x/N 步」——点击输入任意步跳转）
 		statusText = add_text(this, posX + currentTime.width + 20, posY, "", "#ff9999");
+{% if is_broadcast %}
+		statusText.setInteractive();
+		statusText.on("pointerdown", function () {
+			let n = prompt("跳转到第几步？（1 ~ " + total_steps + "）", String(Math.max(1, bc_last_step)));
+			if (n === null) return;               // 取消
+			let v = parseInt(n, 10);
+			if (isNaN(v) || v < 1 || v > total_steps) return;   // 非法输入忽略
+			bc_seek(v);
+		});
+{% endif %}
 
 		// Show conversation content
 		textConversation = add_text(this, 20, posY + currentTime.height + 10, " —— ", "#ccffcc");
@@ -893,6 +994,7 @@
 			bc_last_status = status;
 			statusText.setText(status);
 		}
+		bc_refresh_card_age(frame);   // 展开中的信息卡：年龄随画面时刻实时增长
 		bc_last_frame = frame;
 	}
 {% endif %}

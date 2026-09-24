@@ -96,6 +96,21 @@ def bc_set_rate(rate):
         return _bc_snapshot()
 
 
+def bc_seek(step):
+    """全场跳转到第 step 步开头（帧号 1 = 第 1 步第 1 帧）。
+
+    只重设虚拟时钟基准，保持当前的暂停状态与倍率不变 —— 跳转是「拖动进度条」，
+    不是「换节目」；暂停中跳转，跳完仍是暂停，所有观众 2 秒内自动跟上。
+    """
+    with _bc_lock:
+        now = time.time() * 1000
+        ms_per_frame = broadcast_ms_per_step // frames_per_step
+        offset = (int(step) - 1) * frames_per_step * ms_per_frame
+        _bc["vbase"] = broadcast_anchor_ms + offset
+        _bc["wbase"] = now
+        return _bc_snapshot()
+
+
 # 模拟刚启动、还没产出第一步时展示的等待页（会自动重试）
 waiting_page = """<!DOCTYPE html>
 <html lang="zh-CN">
@@ -402,6 +417,21 @@ def bc_rate_route():
     if rate <= 0 or rate > 10:
         return jsonify({"error": "rate 超出范围（0 < r <= 10）"}), 400
     return jsonify(bc_set_rate(rate))
+
+
+@app.route("/bc/seek", methods=['POST', 'GET'])
+def bc_seek_route():
+    """全场跳转到第 N 步开头（保持暂停状态与倍率）。用法：/bc/seek?step=3
+
+    范围校验在前端（它知道总步数）；这里只挡非数字与负数。
+    """
+    try:
+        step = int(request.args.get("step", ""))
+    except (TypeError, ValueError):
+        return jsonify({"error": "step 必须是整数，例如 /bc/seek?step=3"}), 400
+    if step < 1:
+        return jsonify({"error": "step 必须 >= 1"}), 400
+    return jsonify(bc_seek(step))
 
 
 @app.route("/", methods=['GET'])

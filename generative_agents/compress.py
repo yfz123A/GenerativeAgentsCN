@@ -13,6 +13,16 @@ life_events_file = "life_events.json"
 frames_per_step = 60  # 每个step包含的帧数
 
 maze_path = "frontend/static/assets/village/maze.json"
+seed_path = "data/seed.json"
+
+
+def load_seed():
+    """读种子文件（角色性别 / 基准年龄 / 生命节奏）；缺失时返回空结构。"""
+    try:
+        with open(seed_path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {"agents": [], "world": {}}
 
 
 # 将address转换为字符串
@@ -184,6 +194,16 @@ class MovementBuilder:
                     }
             self.all_movement["conversation"][step_time] = step_conversation
 
+            # 侧边栏「近期状况 / 身体状况」取运行时状态（反复覆盖，最终即最后一步的值）。
+            # 旧版只在第 0 帧写入静态人设，之后从不更新 —— 观众看到的永远是开局设定。
+            detail = self.all_movement["description"].get(agent_name) or {}
+            if agent_data.get("currently"):
+                detail["currently"] = agent_data["currently"]
+            life_state = agent_data.get("life") or {}
+            if life_state.get("health"):
+                detail["health"] = life_state["health"]
+            self.all_movement["description"][agent_name] = detail
+
         # 花名册：记录每个角色首次/最后一次出现的步（生死决定何时出现、何时变墓碑）
         for agent_name in agents.keys():
             record = self.agent_steps.setdefault(agent_name, [step, step])
@@ -201,7 +221,9 @@ class MovementBuilder:
         """生成花名册：每个角色的存在区间，以及死亡/出生信息。
 
         帧号规则与 all_movement 一致：第 N 步覆盖帧 [(N-1)*60+1, N*60]，第 0 帧为初始状态。
+        另带静态属性（性别 / 基准年龄），供回放侧边栏计算实时年龄与展示。
         """
+        seed = {a["name"]: a for a in load_seed().get("agents", [])}
         events = getattr(self, "life_events", [])
         roster = {}
         for agent_name, (first_step, last_step) in self.agent_steps.items():
@@ -211,6 +233,10 @@ class MovementBuilder:
                 "first_frame": first_frame,  # 出现在地图上的帧
                 "last_frame": last_step * frames_per_step,
             }
+            info = seed.get(agent_name)
+            if info:
+                entry["gender"] = info.get("gender", "")
+                entry["base_age"] = float(info.get("age", 0))
             roster[agent_name] = entry
 
         for event in events:
@@ -286,6 +312,7 @@ class MovementBuilder:
             "start_datetime": self.start_datetime,  # 起始时间
             "stride": self.stride,  # 每个step对应的分钟数（必须与生成时的参数一致）
             "sec_per_step": self.stride,  # 回放时每一帧对应的秒数
+            "years_per_sim_day": load_seed().get("world", {}).get("years_per_sim_day", 4),  # 生命节奏：1 模拟日 = 多少岁
             "persona_init_pos": init_pos,  # 每个Agent的初始位置（含中途入场者）
             "roster": roster,  # 花名册（出生/入学/死亡区间，回放据此生成、显隐与墓碑化）
             "all_movement": self.all_movement,  # 所有Agent在每个setp中的位置变化

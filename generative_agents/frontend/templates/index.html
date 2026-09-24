@@ -35,7 +35,9 @@
             </div>
             <div class="media-body" style='padding-left:3em; padding-top:1em; padding-bottom:0em'>
                 <div style="">
-                    <p style="font-size:1.0em"><span id="agent_desc__{{ p }}"></span></p>
+                    <p style="font-size:1.0em">年龄：<span id="agent_age__{{ p }}">—</span>　性别：<span id="agent_gender__{{ p }}">—</span>　身体状况：<span id="agent_health__{{ p }}">—</span></p>
+                    <p style="font-size:1.0em">配偶：<span id="agent_spouse__{{ p }}">—</span>　住所：<span id="agent_home__{{ p }}">—</span></p>
+                    <p style="font-size:1.0em">近期状况：<span id="agent_desc__{{ p }}"></span></p>
                     <p style="font-size:1.0em">当前活动：<span id="current_action__{{ p }}"></span> @ <span id="target_address__{{ p }}"></span></p>
                 </div>
             </div>
@@ -51,6 +53,7 @@
 <script>
 {% for p in persona_names %}
     $('#on_screen_det_trigger-{{ p }}').click(function() {
+        if (window.fill_agent_card) fill_agent_card('{{ p }}');   // 填充角色信息卡（main_script 提供）
         $('#on_screen_det_content-init').css({
           'display': 'none',
         });
