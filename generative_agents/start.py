@@ -425,9 +425,6 @@ class SimulateServer:
                 "age": round(age, 1), "time": now.strftime("%Y%m%d-%H:%M"),
             })
 
-        if len(events) > 0:
-            self.life_events.extend(events)
-            self.save_life_events()
         return events
 
     def give_birth(self, mother_name, state, day, step, now):
